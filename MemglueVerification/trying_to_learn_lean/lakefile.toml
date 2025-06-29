@@ -1,0 +1,10 @@
+name = "trying_to_learn_lean"
+version = "0.1.0"
+defaultTargets = ["trying_to_learn_lean"]
+
+[[lean_lib]]
+name = "TryingToLearnLean"
+
+[[lean_exe]]
+name = "trying_to_learn_lean"
+root = "Main"
