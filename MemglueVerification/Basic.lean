@@ -1,31 +1,22 @@
 import Mathlib
--- CONSTANTS -----------------------------
--- def ShimCount : ℕ := 2
--- def DataCount : ℕ := 4
--- def NetMax : ℕ := 10
--- def AddrCount : ℕ := 2
--- def MaxTimestamp : ℕ := 100
--- def InstrCount : ℕ := 2
+
 structure SystemConfig where
-    threads     : Nat
-    steps       : Nat
-    addrCount   : Nat
+    threads     : PNat          -- positive Nat: 1, 2, 3, ...
+    steps       : PNat
+    addrCount   : PNat
 deriving Inhabited
 
 
 -- TYPES -----------------------------------------
 abbrev ShimId (c : SystemConfig) : Type := Fin (c.threads)
 abbrev Addr (c : SystemConfig) : Type := Fin (c.addrCount)
--- def Data : Type := Fin (DataCount + 1)
 abbrev Data : Type := Nat
--- def Timestamp : Type := Fin (MaxTimestamp + 1)
 abbrev Timestamp : Type := Nat
 abbrev Node (c : SystemConfig) : Type := Fin (c.threads + 1)
--- ShimId: 1..ShimCount;       	-- For indexing into list of shims
--- Addr: 0..AddrCount-1;		      -- For indexing into cache
--- Data: 0..DataCount;
--- Timestamp: 0..MaxTimestamp;
--- Node: 0..ShimCount;         	-- This represents the CC plus the shims: CC = 0, Shims = 1..ShimCount+1
+
+instance (c : SystemConfig) : Inhabited (ShimId c) where default := 0
+instance (c : SystemConfig) : Inhabited (Addr c) where default := 0
+instance (c : SystemConfig) : Inhabited (Node c) where default := 0
 
 inductive MType : Type where
     | WRITE
@@ -41,39 +32,57 @@ inductive OpStrength : Type where
     | REL
     | ACQ
     | SC
+deriving Inhabited, DecidableEq
+
 structure Message (c : SystemConfig) : Type where
-    mtype : MType
-    src : Node c
-    dst : Node c
-    data :  Data
-    addr : Option (Addr c)
-    ts : Timestamp
-    stren : OpStrength
+    mtype : MType := MType.WRITE
+    src : Node c := 0
+    dst : Node c := 0
+    data :  Data := 0
+    addr : Addr c := 0
+    ts : Timestamp := 0
+    stren : OpStrength := OpStrength.RLX
+instance (c : SystemConfig) : Inhabited (Message c) where
+    default := {
+        mtype := MType.WRITE
+        src := 0
+        dst := 0
+        data := 0
+        addr := 0
+        ts := 0
+        stren := OpStrength.RLX
+    }
 
 -- matrix one row of messages per node (CC + shims)
 -- def NETOrdered : Type := Matrix Node (Fin NetMax) Message
 def NETOrdered (c : SystemConfig) : Type := Vector (List (Message c)) (c.threads + 1)
--- def NETOrderedCount : Type := Vector ℕ (ShimCount + 1)
+instance (c : SystemConfig) : Inhabited (NETOrdered c) where default := Vector.replicate (c.threads + 1) (List.singleton (default : (Message c)))
 -- NETOrdered: array[Node] of array[0..NetMax-1] of Message;
 -- NETOrderedCount: array[Node] of 0..NetMax;
 -- NETUnordered: array[Node] of multiset[NetMax] of Message;
 
 inductive CacheState : Type where
     | Invalid | Valid
+deriving Inhabited, DecidableEq
 
 structure ShimElemState : Type where
     state : CacheState
     data : Data
     ts : Timestamp
     syncBit : Bool
+deriving Inhabited
 
 structure CCElemState (c : SystemConfig) : Type where
     data : Data
     ts : Timestamp
     sharers : Vector Bool c.threads
+deriving Inhabited
 
 def ShimCache (c : SystemConfig) : Type := Vector ShimElemState c.addrCount
+instance (c : SystemConfig) : Inhabited (ShimCache c) where default := Vector.replicate c.addrCount (default : ShimElemState)
+
 def CCCache (c : SystemConfig) : Type := Vector (CCElemState c) c.addrCount
+instance (c : SystemConfig) : Inhabited (CCCache c) where default := Vector.replicate c.addrCount (default : CCElemState c)
 
 -- Litmus test specific---------
 inductive PermissionType : Type where
@@ -81,7 +90,7 @@ inductive PermissionType : Type where
     | store
     | fence
     | none
-deriving DecidableEq
+deriving DecidableEq, Inhabited
 
 structure Instr (c : SystemConfig) : Type where
     access : PermissionType       -- may not need this
@@ -89,6 +98,7 @@ structure Instr (c : SystemConfig) : Type where
     addr : Addr c
     data : Data      -- Value store for read operation performed */
     pend : Bool
+deriving Inhabited
 
 -- structure FifoQueue : Type where                      -- each shim has a queue of litmust test instructions to perform
 --     Queue: Vector Instr InstrCount -- array[0..2] of Instr;
@@ -98,6 +108,9 @@ structure Instr (c : SystemConfig) : Type where
 ---------------------------------
 abbrev QInd (c : SystemConfig) : Type := Fin c.steps
 abbrev QCnt (c : SystemConfig) : Type := Fin c.steps
+instance (c : SystemConfig) : Inhabited (QInd c) where default := 0
+instance (c : SystemConfig) : Inhabited (QCnt c) where default := 0
+
 structure Shim (c : SystemConfig) : Type where
     state : ShimCache c
     active : Bool   -- active = still needs to execute litmus tests instructions
@@ -106,13 +119,15 @@ structure Shim (c : SystemConfig) : Type where
     -- queue : FifoQueue   -- queue of litmus test instructions to be performed. replaced with tracesets
     qInd : QInd c
     qCnt : QCnt c
+deriving Inhabited
 
 structure CCMachine (c : SystemConfig) : Type where
     cache : CCCache c
+deriving Inhabited
 
 -- NOTE: this is zero indexed unlike in murphi model....... change?
 def ShimType (c : SystemConfig) : Type := Vector (Shim c) c.threads    -- array[ShimId] of Shim;
-
+instance (c : SystemConfig) : Inhabited (ShimType c) where default := Vector.replicate c.threads (default : Shim c)
 
 
 ----------------------------------------------------------------------
@@ -157,9 +172,11 @@ def TraceSet (α : Type u) (threads : Nat) (steps : Nat) := Fin threads → Trac
 
 -- The execution trace generated by the program.
 def Execution (c : SystemConfig) := TraceSet (Instr c) c.threads c.steps
+instance (c : SystemConfig) : Inhabited (Execution c) where default := fun _ _ => (default : Instr c)
 -- #check Execution 3 2
 -- The output trace generated by the cache coherence protocol.
 def Output (c : SystemConfig) := TraceSet (Option Nat) c.threads c.steps
+instance (c : SystemConfig) : Inhabited (Output c) where default := fun _ _ => none
 -- #check Output 3 2
 -- def QInd (c : SystemConfig) := Vector (Fin c.steps) c.threads
 -- #check QInd 3 2
@@ -217,10 +234,10 @@ def sendFence {c : SystemConfig} (mtype' : MType) (src' : Node c) (dst' : Node c
                               src := src',
                               dst := dst',
                             --   remaining don't matter ↓
-                              data := 0,
-                              addr := none,
-                              ts := 0,
-                              stren := OpStrength.RLX,
+                            --   data := 0,
+                            --   addr := none,
+                            --   ts := 0,
+                            --   stren := OpStrength.RLX,
                              }
     netWithAddedMsg msg net
 
@@ -368,36 +385,57 @@ def shimIncrTS {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (shimVec : S
 def shimReceive {c : SystemConfig} (msg : Message c)
                 (shimVec : ShimType c) (e : Execution c) (o : Output c)
                 : (ShimType c) × (Execution c) × (Output c) :=
-    if h1 : msg.dst < c.threads then
+    if h1 : msg.dst < c.threads.val then
         let curShim : ShimId c := ⟨msg.dst, h1⟩
         let curShimCache : ShimCache c := (shimVec.get curShim).state
+        let addr := msg.addr
 
-        match msg.mtype, msg.addr with
-            | MType.WRITE, some addr =>
+        match msg.mtype with
+            | MType.WRITE =>
                 let shimElem : ShimElemState := curShimCache.get addr
                 if msg.ts > shimElem.ts then
                     (shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec, e, o)
                 else
                     (shimIncrTS curShim addr shimVec, e, o)
-            | MType.WRITE_ACK, some addr =>
+            | MType.WRITE_ACK =>
                 let shimElem : ShimElemState := curShimCache.get addr
                 if shimElem.syncBit = true then
-                    let modShims : ShimType c := ShimWriteCache curShim CacheState.Valid shimElem.data msg.ts+shimElem.ts-1 addr
-                    -- TODO
-            -- shimElem := Shims[msg.dst].state[msg.addr];
+                    let newTs : Timestamp := msg.ts+shimElem.ts-1
+                    let modShims : ShimType c := shimWriteCache curShim CacheState.Valid shimElem.data newTs addr shimVec
+                    let modShimElem : ShimElemState := {(modShims.get curShim).state.get addr with syncBit := false}
+                    let modShimCache : ShimCache c := (modShims.get curShim).state.set addr modShimElem
+                    let modShim : Shim c := {(modShims.get curShim) with state := modShimCache, pendingWSC := false}
 
-        --       if (shimElem.syncBit) then
-        --         ShimWriteCache(msg.dst,Valid,shimElem.data,msg.ts+shimElem.ts-1,msg.addr);  -- Q: not actually modifying cache data? why -1
-        --         Shims[msg.dst].state[msg.addr].syncBit := false;
-        --       endif;
-        --       if Shims[msg.dst].pendingWSC then
-        --         Shims[msg.dst].pendingWSC := false;
-        --       endif;
-            | MType.RRESP, some addr => (shimVec, e, o)
-            | MType.FRESP, some addr => (shimVec, e, o)
-            | _, _ => (shimVec, e, o)
+                    let newShimVec : ShimType c := modShims.set curShim modShim
+                    (newShimVec, e, o)
+                else
+                    let modShim : Shim c := {(shimVec.get curShim) with pendingWSC := false}
+                    let newShimVec : ShimType c := shimVec.set curShim modShim
+                    (newShimVec, e, o)
+            | MType.RRESP =>
+                let modShims : ShimType c := shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec
+                let modShimElem : ShimElemState := {(modShims.get curShim).state.get addr with syncBit := false}
+                let modShimCache : ShimCache c := (modShims.get curShim).state.set addr modShimElem
+                let modShim : Shim c := {(modShims.get curShim) with state := modShimCache}
+                let modShims' : ShimType c := modShims.set curShim modShim
+
+                let newOutput := updateVal curShim msg.data e shimVec o
+                let (newShimVec, newExec) := popInstr curShim modShims' e
+                (newShimVec, newExec, newOutput)
+            | MType.FRESP =>
+                let modShim : Shim c := {(shimVec.get curShim) with fencePending := false}
+                let modShimVec : ShimType c := shimVec.set curShim modShim
+
+                if (shimVec.get curShim).pendingWSC = false then
+                    let (newShimVec, newExec) := popInstr curShim modShimVec e
+                    (newShimVec, newExec, o)
+                else
+                    let modShim' := {(shimVec.get curShim) with pendingWSC := false}
+                    let newShimVec : ShimType c := modShimVec.set curShim modShim'
+                    (newShimVec, e, o)
+            | _ => panic! "message with wrong message type was passed into ShimReceive"        -- no change in weird error cases (msg.dst = c.threads means CC but this is shimReceive... shouldn't happen)
     else
-        (shimVec, e, o)             -- no change in weird error cases (msg.dst = c.threads means CC but this is shimReceive... shouldn't happen)
+        panic! "message with destination that was not a shim was passed into ShimReceive (was CC or some other random dst value)"
 
 --   Procedure ShimReceive(msg:Message);
 --   var shimElem:ShimElemState;
@@ -413,7 +451,6 @@ def shimReceive {c : SystemConfig} (msg : Message c)
 --     case WRITE:									-- Q: non-local write from CC from another shim?
 --       shimElem := Shims[msg.dst].state[msg.addr];
 --       Assert (!shimElem.syncBit) "syncBit set on write update";
-
 --       if msg.ts > shimElem.ts
 --       then
 --         ShimWriteCache(msg.dst,Valid,msg.data,msg.ts,msg.addr);
@@ -458,4 +495,233 @@ def shimReceive {c : SystemConfig} (msg : Message c)
 --       error "Shim received invalid message type!";
 --     endswitch;
 
+--   End;
+
+
+
+-- SHIM: outgoing messages
+-- Write value, or send WRITE to CC
+def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength)
+              (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) :
+              (ShimType c) × (Execution c) × (NETOrdered c) :=
+            let newTs : Timestamp := ((shimVec.get shim).state.get addr).ts + 1
+            let (shimVec', e') := popInstr shim shimVec e
+            let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
+
+            let shimNode : Node c := Fin.castSucc shim
+            let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+            -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
+
+            let net' := send MType.WRITE shimNode CCNode data addr newTs stren net
+            if stren = OpStrength.SC then
+                let modShim := {shimVec''.get shim with pendingWSC := true}
+                let shimVec''' := shimVec''.set shim modShim
+                (shimVec''', e', net')
+            else
+                (shimVec'', e', net')
+--   Procedure ShimWrite(shim: ShimId; addr: Addr; data: Data; stren: OpStrength);
+--   var shimElem:ShimElemState;
+--   Begin
+--     shimElem := Shims[shim].state[addr];
+--     PopInstr(shim); -- CHECK Write perform immediately so no need to wait for CC to respond...
+--     ShimWriteCache(shim,Valid,data,shimElem.ts+1,addr);
+--     Assert (CCOpen()) "ShimWrite - too many messages";
+--     Send(WRITE,shim,0,data,addr,shimElem.ts+1,stren);
+--     if stren = SC then
+--       Shims[shim].pendingWSC := true;
+--     endif;
+--   End;
+
+--   -- Read value, or send RREQ to CC
+def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
+    (shimVec : ShimType c) (net : NETOrdered c) (e : Execution c) (o : Output c) :
+    (ShimType c) × (NETOrdered c) × (Execution c) × (Output c) :=
+    let shimElem := ((shimVec.get shim).state).get addr
+    if shimElem.state ≠ CacheState.Valid then
+        let shimNode := shim.castSucc
+        let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+        let net' := send MType.RREQ shimNode CCNode shimElem.data addr shimElem.ts stren net
+        (shimVec, net', e, o)
+    else
+        let o' := updateVal shim shimElem.data e shimVec o
+        let (shimVec', e') := popInstr shim shimVec e
+        (shimVec', net, e', o')
+--   Procedure ShimRead(shim: ShimId; addr: Addr; stren: OpStrength);
+--   var shimElem:ShimElemState;
+--   Begin
+--     shimElem := Shims[shim].state[addr];
+
+--     if (shimElem.state != Valid) then
+--       Assert (CCOpen()) "ShimRead - too many messages";
+--       Send(RREQ,shim,0,shimElem.data,addr,shimElem.ts,stren);
+--     else
+--       UpdateVal(shim, shimElem.data);
+--       PopInstr(shim); -- CHECK
+--     endif;
+--   End;
+
+--   -- Stop local reads until FRESP received
+def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETOrdered c) :
+    (ShimType c) × (NETOrdered c) :=
+        let modShim := {shimVec.get shim with fencePending := true}
+        let shimVec' := shimVec.set shim modShim
+
+        let shimNode := shim.castSucc
+        let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+        let net' := sendFence MType.FREQ shimNode CCNode net
+        (shimVec', net')
+--   Procedure ShimFence(shim: ShimId);
+--   Begin
+--     Shims[shim].fencePending := true;
+--     SendFence(FREQ,shim,0);
+--   End;
+
+
+  -- CC: process messages -----------------------------------------------------
+def CCSendMsgToSharers {c : SystemConfig} (potentialSharer : Nat) (msg : Message c) (net : NETOrdered c) (CC : CCMachine c) : NETOrdered c :=
+        let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+        if h : potentialSharer < c.threads then
+            match potentialSharer with
+            | 0 =>
+                if 0 ≠ msg.src ∧ (CC.cache.get msg.addr).sharers.get 0 = true then
+                    send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+                else
+                    net
+            | ps + 1 =>
+                let curShim : ShimId c := ⟨ps + 1, h⟩
+                let curNode : Node c := curShim.castSucc
+                let next := ps
+                if curNode ≠ msg.src ∧ (CC.cache.get msg.addr).sharers.get curShim = true then
+                    let net' := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+                    CCSendMsgToSharers next msg net' CC
+                else
+                    CCSendMsgToSharers next msg net CC
+        else panic! "potentialSharer passed into CCsendToSharers is not a valid shimId (≥ c.threads)"
+
+def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
+    if h : msg.src < c.threads.val then
+        let sharerVec' := (CC.cache.get msg.addr).sharers.set msg.src true
+        let CCElemData' := {(CC.cache.get msg.addr) with sharers := sharerVec'}
+        let CCCache' := CC.cache.set msg.addr CCElemData'
+        let CC' := {CC with cache := CCCache'}
+        CC'
+    else
+        panic! "source of message to the CC was the CC??"
+
+def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETOrdered c) : (CCMachine c) × (NETOrdered c) :=
+    let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+    match msg.mtype with
+    | MType.WRITE =>
+        if h : msg.src < c.threads.val then
+            -- write data, increment ts
+            let CCElemData' : CCElemState c := {(CC.cache.get msg.addr) with data := msg.data, ts := (CC.cache.get msg.addr).ts + 1}
+            let CCCache' : CCCache c := CC.cache.set msg.addr CCElemData'
+            let CC' : CCMachine c := {CC with cache := CCCache'}
+
+            -- send write to sharers
+            let net' := CCSendMsgToSharers (c.threads - 1) msg net CC'
+
+            -- If SC or first write, send write acknowledgement
+            let msgSrcShim : ShimId c := ⟨msg.src, h⟩
+            let net'' :=
+                if msg.stren = OpStrength.SC ∨ (CC'.cache.get msg.addr).sharers.get msgSrcShim = false then
+                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache.get msg.addr).ts msg.stren net'
+                else net'
+
+            -- add src to sharers
+            -- let sharerVec' := (CC'.cache.get msg.addr).sharers.set msgSrcShim true
+            -- let CCElemData'' := {(CC'.cache.get msg.addr) with sharers := sharerVec'}
+            -- let CCCache'' := CC'.cache.set msg.addr CCElemData''
+            -- let CC'' := {CC' with cache := CCCache''}
+            let CC'' := CCAddSrcShimToSharers CC' msg
+            (CC'', net'')
+        else
+            panic! "source of message to the CC was the CC??"
+    | MType.RREQ =>
+        let CC' := CCAddSrcShimToSharers CC msg
+        let net' := send MType.RRESP CCNode msg.src (CC.cache.get msg.addr).data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+        (CC', net')
+--     case RREQ:
+--       CC.cache[msg.addr].sharers[msg.src] := Y;    -- Add shim to sharers
+--       Assert (NetworkOpen()) "CCReceive RREQ - too many messages";
+--       Send(RRESP,0,msg.src,CC.cache[msg.addr].data,msg.addr,CC.cache[msg.addr].ts,msg.stren);
+    | MType.FREQ => --SendFence(FRESP,0,msg.src);
+        let net' := sendFence MType.FRESP CCNode msg.src net
+        (CC, net')
+    | _ => panic! "CC received message of invalid type"
+--   Procedure CCReceive(msg:Message);
+--   Begin
+--     switch msg.mtype
+
+--     case WRITE:
+--       CC.cache[msg.addr].data := msg.data; -- always perform write
+--       CC.cache[msg.addr].ts := CC.cache[msg.addr].ts+1;
+
+--       -- send write to sharers
+--       Assert (NetworkOpen()) "CCReceive Write - too many messages";
+--       for sharer:ShimId do
+--         if (sharer != msg.src & CC.cache[msg.addr].sharers[sharer] = Y)
+-- 	      then
+--           Send(WRITE,0,sharer,msg.data,msg.addr,CC.cache[msg.addr].ts,msg.stren);
+-- 	      endif;
+--       endfor;
+
+--       -- If SC or first write, send write acknowledgement
+--       if msg.stren = SC | (CC.cache[msg.addr].sharers[msg.src] = N) then
+--         Send(WRITE_ACK,0,msg.src,msg.data,msg.addr,CC.cache[msg.addr].ts,msg.stren);
+--       endif;
+
+--       -- add src to sharers
+--       CC.cache[msg.addr].sharers[msg.src] := Y;
+
+--     case RREQ:
+--       CC.cache[msg.addr].sharers[msg.src] := Y;    -- Add shim to sharers
+--       Assert (NetworkOpen()) "CCReceive RREQ - too many messages";
+--       Send(RRESP,0,msg.src,CC.cache[msg.addr].data,msg.addr,CC.cache[msg.addr].ts,msg.stren);
+
+--     case FREQ:
+--       Assert (NetworkOpen()) "CCReceive FREQ - too many messages";
+--       SendFence(FRESP,0,msg.src);
+
+--     else
+--       error "CC received invalid message type!";
+--     endswitch
+--   End;
+
+
+def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
+: (Execution c) × (Instr c) :=
+    let qInd := (shimVec.get shim).qInd
+    let e' :=
+        fun (t : ShimId c) =>
+            fun (s : Fin c.steps) =>
+                if t = shim ∧ s = qInd then {e t s with pend := true}
+                else e t s
+    (e', e' shim qInd)
+
+  -- Litmus test-specific -----------------------------------------------------
+
+  -- Fetch shim's next litmus test instructions
+--   Function GetInstr(shim: ShimId): Instr;
+--   var instr: Instr;
+--   Begin
+--     alias sQ: Shims[shim].queue.Queue do
+--     alias QInd: Shims[shim].queue.QueueInd do
+--     alias QCnt: Shims[shim].queue.QueueCnt do
+--     undefine instr;
+
+--     if QInd = QCnt
+--     then
+--       return instr;
+--     endif;
+
+--     if !isundefined(sQ[QInd].access)
+--     then
+--       sQ[QInd].pend := true;
+--       return sQ[QInd];
+--     endif;
+
+--     endalias;
+--     endalias;
+--     endalias;
 --   End;
