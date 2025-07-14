@@ -1,0 +1,20 @@
+-- Shim2Read y=0 -> Shim1Write x=1 ->  Shim2Read
+-- CCReceive WRITEx=1 -> CCreceive RREQ x -> Shim2Receive RRESP x=1
+
+getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c) : Execution c × Instr c
+
+def shimReceive {c : SystemConfig} (msg : Message c)
+                (shimVec : ShimType c) (e : Execution c) (o : Output c)
+                : (ShimType c) × (Execution c) × (Output c) :=
+
+shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength) (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) : ShimType c × Execution c × NETOrdered c
+
+shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength) (shimVec : ShimType c)
+  (net : NETOrdered c) (e : Execution c) (o : Output c) : ShimType c × NETOrdered c × Execution c × Output c
+
+
+def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETOrdered c) : (CCMachine c) × (NETOrdered c) :=
+
+
+shimWriteCache {c : SystemConfig} (shim : ShimId c) (state' : CacheState) (data' : Data) (ts' : Timestamp)
+  (addr : Addr c) (shimVec : ShimType c) : ShimType c
