@@ -1,6 +1,8 @@
 import Mathlib
 set_option diagnostics true
 
+--TODOs: remove Output from everything (T^T). look into proof for Na < Rlx, still include Na/RelAcq in the c11 model (create new instruction type for c11 instructions with these strengths) but memglue model is fine. Add initialization writes to Set of events (as if the writes were in a separate additional thread). look into the rc11 cat model (check email for readings)
+
 structure SystemConfig where
     threads     : PNat          -- positive Nat: 1, 2, 3, ...
     steps       : PNat
@@ -29,7 +31,7 @@ inductive MType : Type where
     | RRESP
     | FRESP
 deriving Repr
-
+--TODO proof that na < rlx
 inductive OpStrength : Type where
     | RLX
     | REL
@@ -118,7 +120,7 @@ structure Instr (c : SystemConfig) : Type where
     access : PermissionType
     stren : OpStrength
     addr : Addr c
-    data : Data      -- Value store for read operation performed */
+    data : Data      -- (not) Value store for read operation performed */
     pend : Bool
 deriving Inhabited, Repr
 
@@ -619,14 +621,14 @@ def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : 
 
 -----------------------------------------------------------------------
 -- state transition
--- TODO: take in execution here.
+
 inductive increment_init {c : SystemConfig} : IncState c → Prop where
     | IncInit : forall (e : Execution c),                     -- IncInit is a proof that the state {...} satisfies increment_init
         increment_init {
             cc := (default : CCMachine c)
             shimVec := (default : ShimType c)
             net := (default : NETOrdered c)
-            execution := e
+            execution := e --TODO translation function.
             output := (default : Output c)
             done := default
         }

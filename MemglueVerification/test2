@@ -18,3 +18,7 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
 
 shimWriteCache {c : SystemConfig} (shim : ShimId c) (state' : CacheState) (data' : Data) (ts' : Timestamp)
   (addr : Addr c) (shimVec : ShimType c) : ShimType c
+
+
+def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETOrdered c) :
+    (ShimType c) × (NETOrdered c) :=
