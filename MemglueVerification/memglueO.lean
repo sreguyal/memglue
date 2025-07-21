@@ -1,8 +1,6 @@
 import Mathlib
 set_option diagnostics true
 
--- TODOs: remove Output from everything. look into proof for Na < Rlx, still include Na/RelAcq in the c11 model (create new instruction type for c11 instructions with these strengths). Add initialization writes to Set of events (as if the writes were in a separate additional thread). look into the rc11 cat model (check email for readings)
-
 structure SystemConfig where
     threads     : PNat          -- positive Nat: 1, 2, 3, ...
     steps       : PNat
