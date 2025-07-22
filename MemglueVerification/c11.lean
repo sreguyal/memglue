@@ -196,6 +196,16 @@ def valid_exec_graph {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
     valid_mo eg.evts eg.mo
 ----------------------------------------------
 
+def restrict_domain {c : SystemConfig} (r : rlt (Event c)) (p : (Event c) → Prop) : rlt (Event c) :=
+    fun e1 =>
+        fun e2 =>
+            r e1 e2 ∧ p e1
+
+def restrict_range {c : SystemConfig} (r : rlt (Event c)) (q : (Event c) → Prop) : rlt (Event c) :=
+    fun e1 =>
+        fun e2 =>
+            r e1 e2 ∧ q e2
+
 def restrict_rel {c : SystemConfig} (r : rlt (Event c)) (p q : (Event c) → Prop) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
@@ -208,9 +218,6 @@ def id_rel {c : SystemConfig} : rlt (Event c) :=
     fun x y => x = y
 
 def is_fence {c : SystemConfig} (e : Event c) : Prop := e.access = PermissionType.fence
-
-def fence_id {c : SystemConfig} : rlt (Event c) :=
-    restrict_rel id_rel is_fence is_fence
 
 
 
@@ -226,8 +233,6 @@ well as all read-modify-write that recursively read from such writes. *)
 
 Definition rs  :=
   [W] ⋅ (res_eq_loc (sb ex)) ? ⋅ [W] ⋅ [Mse Rlx] ⋅ ((rf ex) ⋅ (rmw ex)) ^*.-/
-
-
 
 def rs {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let optional_sb : rlt (Event c) := Relation.ReflGen (res_eq_loc eg.sb)
@@ -252,15 +257,14 @@ in case [b] is a fence, a [sb]-prior read) reads from the release sequence of
 [a] *)-/
 
 /-Definition sw :=
-  [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx] ⋅ ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq].-/
+  [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx] ⋅
+  ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq].-/
+
 def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let geq_rel_filter : Event c → Prop :=
         fun e => stronger_or_eq_mode e.mode REL
 
-    --? need fence_id here because how else can i compose and do reflgen?
-    let optional_fence_sb : rlt (Event c) := Relation.ReflGen (Rel.comp fence_id eg.sb)
-    --? could do ↓
-    -- let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_rel eg.sb is_fence (fun e => true))
+    let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_domain eg.sb is_fence)
 
     let geq_rlx_r_filter : Event c → Prop :=
         fun e => stronger_or_eq_mode e.mode RLX ∧
@@ -271,22 +275,15 @@ def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let base :=
         restrict_rel opt_f_sb_rs_rf geq_rel_filter geq_rlx_r_filter
 
-    let optional_sb_fence : rlt (Event c) := Relation.ReflGen (Rel.comp eg.sb fence_id)
-
+    let optional_sb_fence : rlt (Event c) := Relation.ReflGen (restrict_range eg.sb is_fence)
     let geq_acq_filter : Event c → Prop :=
         fun e => stronger_or_eq_mode e.mode ACQ
-    let geq_acq : rlt (Event c) := restrict_rel id_rel geq_acq_filter geq_acq_filter
+    -- ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq]
+    let opt_sb_f_geq_acq := restrict_range optional_sb_fence geq_acq_filter
 
-    Rel.comp (Rel.comp base optional_sb_fence) geq_acq
-    -- Rel.comp (Rel.comp (Rel.comp (Rel.comp (Rel.comp (Rel.comp (Rel.comp
-        -- geq_rel
-        -- optional_fence_sb)
-        -- (rs eg))
-        -- eg.rf)
-        -- read_id)
-        -- geq_rlx)
-        -- optional_sb_fence)
-        -- geq_acq
+    Rel.comp base opt_sb_f_geq_acq
+
+
 
 /-(** ** Reads-before *)
 
@@ -303,7 +300,6 @@ def rb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
             fun e2 =>
                 eg.rf e2 e1
     Rel.comp rf_inv eg.mo
-    -- λ r w => ∃ w', eg.rf w' r ∧ eg.mo w' w
 
 /-(** ** Happens-before *)
 
@@ -326,7 +322,11 @@ def hb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
 /-(** ** SC-before *)
 
 Definition scb :=
- (sb ex) ⊔  ((res_neq_loc (sb ex)) ⋅ hb ⋅ (res_neq_loc (sb ex))) ⊔ (res_eq_loc hb) ⊔ (mo ex) ⊔  (rb ex).-/
+ (sb ex) ⊔
+ ((res_neq_loc (sb ex)) ⋅ hb ⋅ (res_neq_loc (sb ex))) ⊔
+ (res_eq_loc hb) ⊔
+ (mo ex) ⊔
+ (rb ex).-/
 
  def scb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let opt1 := eg.sb
@@ -348,26 +348,22 @@ Definition scb :=
 (** We give a semantic to SC atomics by enforcing the order in which they should
 occur *)-/
 
-def psc_base {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let is_sc : Event c → Prop := fun e => e.mode = Mode.SC
-    let M_sc : rlt (Event c) := restrict_rel id_rel is_sc is_sc
-
-    let F_M_sc_opt_hb := Rel.comp (Rel.comp
-        fence_id
-        M_sc)
-        (Relation.ReflGen (hb eg))
-
-    let part1 := fun e1 => fun e2 =>
-        M_sc e1 e2 ∨ F_M_sc_opt_hb e1 e2
-    /-Definition psc_base :=
+/-Definition psc_base :=
   ([M Sc] ⊔ (([F] ⋅ [M Sc]) ⋅ (hb ?))) ⋅
   (scb) ⋅
   ([M Sc] ⊔ ((hb ?) ⋅ ([F] ⋅ [M Sc]))).-/
 
-    let opt_hb_F_M_sc : rlt (Event c) := Rel.comp
-        (Relation.ReflGen (hb eg))
-        (Rel.comp fence_id
-        M_sc)
+def psc_base {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
+    let is_sc : Event c → Prop := fun e => e.mode = Mode.SC
+    let is_f_sc : Event c → Prop := fun e => e.mode = Mode.SC ∧ e.access = PermissionType.fence
+    let M_sc : rlt (Event c) := restrict_rel id_rel is_sc is_sc
+
+    let F_M_sc_opt_hb := restrict_domain (Relation.ReflGen (hb eg)) is_f_sc
+
+    let part1 := fun e1 => fun e2 =>
+        M_sc e1 e2 ∨ F_M_sc_opt_hb e1 e2
+
+    let opt_hb_F_M_sc := restrict_range (Relation.ReflGen (hb eg)) is_f_sc
     let part3 := fun e1 => fun e2 =>
         M_sc e1 e2 ∨ opt_hb_F_M_sc e1 e2
 
@@ -380,6 +376,7 @@ reads-from, modification order and reads-before. It corresponds to the
 communication relation in some other works on axiomatic memory models *)
 
 Definition eco := ((rf ex) ⊔ (mo ex) ⊔ rb)^+.-/
+
 def eco {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let union : rlt (Event c) :=
         fun e1 =>
@@ -431,27 +428,6 @@ def psc {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
 
 def coherence {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
     forall x, ¬(Rel.comp (hb eg) (Relation.ReflGen (eco eg))) x x
-
-
-/-(** In a coherent execution, [hb] is irreflexive. This means that an event
-should not occur before itself. *)
-
-Lemma coherence_irr_hb:
-  coherence -> (forall x, ~hb x x).
-Proof.
-  intros H x Hnot.
-  apply (H x). exists x.
-  - auto.
-  - right. simpl; auto.
-Qed.-/
-lemma coherence_irr_hb {c : SystemConfig} (eg : ExecutionGraph c) : coherence eg → (forall x, ¬ (hb eg) x x) := by
-    intros H x Hnot  -- H: forall x, ¬ (hb ∘ (eco?)) x x
-    apply H x           -- x is st hb x x (proving by contradiction with Hnot, i assume)
-    use x
-    -- constructor
-    -- · exact Hnot
-    -- · apply Relation.reflTransGen.refl
-
 
 /-(** ** Atomicity *)
 
@@ -511,3 +487,44 @@ Definition rc11_consistent :=
   coherence /\ atomicity /\ SC /\ no_thin_air.-/
 def rc11_consistent {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
     coherence eg ∧ atomicity eg ∧ SC eg ∧ no_thin_air eg
+
+
+
+
+------------------------------------------------------------------
+/-Some lemmas from coq---------------------------------------------/
+------------------------------------------------------------------
+
+/-(** In a coherent execution, [hb] is irreflexive. This means that an event
+should not occur before itself. *)
+
+Lemma coherence_irr_hb:
+  coherence -> (forall x, ~hb x x).
+Proof.
+  intros H x Hnot.
+  apply (H x). exists x.
+  - auto.
+  - right. simpl; auto.
+Qed.-/
+lemma coherence_irr_hb {c : SystemConfig} (eg : ExecutionGraph c) : coherence eg → (forall x, ¬ (hb eg) x x) := by
+    intros H x Hnot  -- H: forall x, ¬ (hb ∘ (eco?)) x x
+    apply H x           -- x is st hb x x (proving by contradiction with Hnot, i assume)
+    use x
+    -- constructor
+    -- · exact Hnot
+    -- · apply Relation.reflTransGen.refl
+
+/-(** sequenced-before is included in happens-before *)
+
+Lemma sb_incl_hb:
+  sb ex ≦ hb.
+Proof.
+  unfold hb. kat.
+Qed.-/
+
+lemma sb_incl_hb {c : SystemConfig} (eg : ExecutionGraph c) :
+    ∀ (e1 e2 : Event c), eg.sb e1 e2 → (hb eg) e1 e2 := by
+        unfold hb
+        intros e1 e2 h
+        constructor
+        · exact Or.intro_left ((sw eg) e1 e2) h
