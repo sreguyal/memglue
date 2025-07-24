@@ -2,14 +2,14 @@ import Mathlib
 import MemglueVerification.memglueO
 
 abbrev rlt (α : Type) := Rel α α
-def example_relation : rlt Nat :=
-    fun a => fun b => a = b
 
 abbrev EventId := Nat × Nat
 
 inductive Mode where
     | NA | RLX | ACQ | REL | ACQREL | SC
-    deriving DecidableEq
+    deriving DecidableEq, Repr
+
+open Mode PermissionType
 
 def same_stren (s : OpStrength) (m : Mode) : Bool :=
     match (s, m) with
@@ -27,6 +27,9 @@ structure Event (c : SystemConfig) where
     eid : EventId
 deriving DecidableEq
 
+-- def example_relation : rlt (Event default) :=
+--     { (a, b) | a.access = PermissionType.store ∧ b.access = PermissionType.store }
+
 def executionToSet {c : SystemConfig} (e : Execution c) : Set (Event c) :=
     let evts_from_exe :=
         {a : Event c | ∃ (t : ShimId c) (s : QInd c),
@@ -38,12 +41,12 @@ def executionToSet {c : SystemConfig} (e : Execution c) : Set (Event c) :=
         (e t s).access ≠ PermissionType.none}
     let initialization_evts : Set (Event c) := (Finset.image
         (fun i =>
-            ({ access := PermissionType.store, mode := Mode.SC, addr := Fin.ofNat c.addrCount i, data := 0, eid := (c.threads + i, 0) } : Event c))
+            ({ access := store, mode := SC, addr := Fin.ofNat c.addrCount i, data := 0, eid := (c.threads + i, 0) } : Event c))
         (Finset.range c.addrCount)).toSet
 
     evts_from_exe ∪ initialization_evts
 
-open Mode
+
 def weaker_mode (m1 m2 : Mode) : Bool :=
 match (m1, m2) with
   | (NA, NA) => false
@@ -60,6 +63,14 @@ match (m1, m2) with
 
 def stronger_or_eq_mode (m1 m2 : Mode) : Bool :=
     ¬ (weaker_mode m1 m2)
+
+def geq_mode_set (base : Mode) : Set Mode :=
+    fun m => stronger_or_eq_mode m base
+
+#check RLX ∈ geq_mode_set RLX
+example : RLX ∈ geq_mode_set RLX := by
+    unfold geq_mode_set
+    exact rfl
 
 /-(** [res_eq_loc r] restricts a relation [r] to the pairs of events that affect
 the same location *)
@@ -91,7 +102,7 @@ def total_rel {α : Type} (r : rlt α) (xs : Set α) : Prop :=
         ((r x y) ∨ (r y x))
 
 def writes_loc {c : SystemConfig} (evts : Set (Event c)) (addr : Addr c) : Set (Event c) :=
-    {e | e ∈ evts ∧ e.access = PermissionType.store ∧ e.addr = addr}
+    {e | e ∈ evts ∧ e.access = store ∧ e.addr = addr}
 
 open Mode
 def read_mode (m : Mode) : Prop :=
@@ -114,9 +125,9 @@ def fence_mode (m : Mode) : Prop :=
 
 def valid_mode {c : SystemConfig} (e : Event c) : Prop :=
     match e.access with
-    | PermissionType.load => read_mode e.mode
-    | PermissionType.store => write_mode e.mode
-    | PermissionType.fence => fence_mode e.mode
+    | load => read_mode e.mode
+    | store => write_mode e.mode
+    | fence => fence_mode e.mode
     | PermissionType.none => panic! "a;skdfj"
 
 def valid_evts {c : SystemConfig} (evts : Set (Event c)) : Prop :=
@@ -143,8 +154,8 @@ def valid_rmw_pair {c : SystemConfig} (sb : rlt (Event c)) (r : Event c) (w : Ev
     | (RLX, REL)
     | (ACQ, REL)
     | (SC, SC) =>
-        (r.access = PermissionType.load ∧
-         w.access = PermissionType.store ∧
+        (r.access = load ∧
+         w.access = store ∧
          r.addr = w.addr ∧
          (imm sb) r w)
     | _ => false
@@ -159,8 +170,8 @@ def valid_rf {c : SystemConfig} (evts : Set (Event c)) (rf : rlt (Event c)) : Pr
             (w.addr = r.addr ∧
             w.data = r.data) ∧
             (w ∈ evts ∧ r ∈ evts) ∧
-            (w.access = PermissionType.store ∧
-            r.access = PermissionType.load)) ∧
+            (w.access = store ∧
+            r.access = load)) ∧
     ∀ w1 w2 r,
         (rf w1 r) ∧ (rf w2 r) → w1 = w2
 -------------------------------------------------------
@@ -171,8 +182,8 @@ def mo_for_loc {c : SystemConfig} (mo : rlt (Event c)) (addr : (Addr c)) : rlt (
 
 def valid_mo {c : SystemConfig} (evts : Set (Event c)) (mo : rlt (Event c)) : Prop :=
     (∀ w1 w2, mo w1 w2 →
-        w1.access = PermissionType.store ∧
-        w2.access = PermissionType.store ∧
+        w1.access = store ∧
+        w2.access = store ∧
         w1.addr = w2.addr) ∧
     (partial_order mo evts) ∧
     (forall addr, total_rel (mo_for_loc mo addr) (writes_loc evts addr))
@@ -196,30 +207,35 @@ def valid_exec_graph {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
     valid_mo eg.evts eg.mo
 ----------------------------------------------
 
-def restrict_domain {c : SystemConfig} (r : rlt (Event c)) (p : (Event c) → Prop) : rlt (Event c) :=
+def restrict_domain {c : SystemConfig} (r : rlt (Event c)) (p : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
             r e1 e2 ∧ p e1
 
-def restrict_range {c : SystemConfig} (r : rlt (Event c)) (q : (Event c) → Prop) : rlt (Event c) :=
+def restrict_range {c : SystemConfig} (r : rlt (Event c)) (q : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
             r e1 e2 ∧ q e2
 
-def restrict_rel {c : SystemConfig} (r : rlt (Event c)) (p q : (Event c) → Prop) : rlt (Event c) :=
+def restrict_rel {c : SystemConfig} (r : rlt (Event c)) (p q : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
             r e1 e2 ∧ p e1 ∧ q e2
 
-def is_write {c : SystemConfig} (e : Event c) : Prop :=
-    e.access = PermissionType.store
-
 def id_rel {c : SystemConfig} : rlt (Event c) :=
     fun x y => x = y
 
-def is_fence {c : SystemConfig} (e : Event c) : Prop := e.access = PermissionType.fence
-
-
+-- def geq_mode {c : SystemConfig} (m : Mode) : Event c → Prop :=
+--     fun e => stronger_or_eq_mode e.mode m
+-- def is_mode {c : SystemConfig} (m : Mode) : Event c → Prop :=
+--     fun e => e.mode = m
+def is_mode {c : SystemConfig} (set : Set Mode) : Set (Event c) :=
+    fun e => e.mode ∈ set
+def is_type  {c : SystemConfig} (t : PermissionType) : Set (Event c) :=
+    fun e => e.access = t
+#check is_mode {RLX}
+-- def is_mode_type {c : SystemConfig} (set : Set Mode) (t : PermissionType) : Event c → Prop :=
+--     fun e => e.mode ∈ set ∧ e.access = t
 
 --------------------------------------------------------------------
 /-Derived relations-------------------------------------------------/
@@ -233,16 +249,15 @@ well as all read-modify-write that recursively read from such writes. *)
 
 Definition rs  :=
   [W] ⋅ (res_eq_loc (sb ex)) ? ⋅ [W] ⋅ [Mse Rlx] ⋅ ((rf ex) ⋅ (rmw ex)) ^*.-/
+set_option diagnostics true
 
 def rs {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let optional_sb : rlt (Event c) := Relation.ReflGen (res_eq_loc eg.sb)
 
-    let is_atomic_w : Event c → Prop :=
-        fun (e : Event c) =>
-            e.access = PermissionType.store ∧
-            (stronger_or_eq_mode e.mode RLX)
-
-    let W_sb_opt_atomic_W : rlt (Event c) := restrict_rel optional_sb is_write is_atomic_w
+    let W_sb_opt_atomic_W : rlt (Event c) :=
+        restrict_rel optional_sb
+            (is_type store)
+            ((is_type store) ∩ (is_mode (geq_mode_set RLX)))
 
     let rf_rmw := Rel.comp eg.rf eg.rmw
     let iter := Relation.ReflTransGen rf_rmw
@@ -260,26 +275,21 @@ in case [b] is a fence, a [sb]-prior read) reads from the release sequence of
   [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx] ⋅
   ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq].-/
 
+
 def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let geq_rel_filter : Event c → Prop :=
-        fun e => stronger_or_eq_mode e.mode REL
-
-    let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_domain eg.sb is_fence)
-
-    let geq_rlx_r_filter : Event c → Prop :=
-        fun e => stronger_or_eq_mode e.mode RLX ∧
-                 e.access = PermissionType.load
+    let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_domain eg.sb (is_type fence))
 
     -- [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx]
     let opt_f_sb_rs_rf := (Rel.comp ((Rel.comp optional_fence_sb (rs eg))) eg.rf)
     let base :=
-        restrict_rel opt_f_sb_rs_rf geq_rel_filter geq_rlx_r_filter
+        restrict_rel opt_f_sb_rs_rf
+            (is_mode (geq_mode_set REL))
+            ((is_mode (geq_mode_set RLX)) ∩ (is_type load))
 
-    let optional_sb_fence : rlt (Event c) := Relation.ReflGen (restrict_range eg.sb is_fence)
-    let geq_acq_filter : Event c → Prop :=
-        fun e => stronger_or_eq_mode e.mode ACQ
+    let optional_sb_fence : rlt (Event c) := Relation.ReflGen (restrict_range eg.sb (is_type fence))
     -- ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq]
-    let opt_sb_f_geq_acq := restrict_range optional_sb_fence geq_acq_filter
+    let opt_sb_f_geq_acq := restrict_range optional_sb_fence
+                            (is_mode (geq_mode_set ACQ))
 
     Rel.comp base opt_sb_f_geq_acq
 
@@ -295,11 +305,7 @@ Definition rb :=
   (rf ex) ° ⋅ (mo ex).-/
 
 def rb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let rf_inv :=
-        fun e1 =>
-            fun e2 =>
-                eg.rf e2 e1
-    Rel.comp rf_inv eg.mo
+    Rel.comp (Rel.inv eg.rf) eg.mo
 
 /-(** ** Happens-before *)
 
@@ -311,12 +317,12 @@ two events consisting of [sb] and [sw] edges *)
 Definition hb  :=
   ((sb ex) ⊔ sw)^+.-/
 
+instance {c : SystemConfig} : Union (rlt (Event c)) :=
+    ⟨fun rel₁ rel₂ e₁ e₂ => rel₁ e₁ e₂ ∨ rel₂ e₁ e₂⟩
+
 def hb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let union_sb_sw : rlt (Event c) :=
-        fun e1 =>
-            fun e2 =>
-                eg.sb e1 e2 ∨ (sw eg e1 e2)
-    Relation.TransGen union_sb_sw
+    let sb_or_sw : rlt (Event c) := eg.sb ∪ (sw eg)
+    Relation.TransGen (sb_or_sw)
 
 
 /-(** ** SC-before *)
@@ -338,10 +344,7 @@ Definition scb :=
     let opt4 := eg.mo
     let opt5 := rb eg
 
-    fun e1 => fun e2 =>
-        opt1 e1 e2 ∨ opt2 e1 e2 ∨
-        opt3 e1 e2 ∨ opt4 e1 e2 ∨
-        opt5 e1 e2
+    opt1 ∪ opt2 ∪ opt3 ∪ opt4 ∪ opt5
 
 /-(** ** Partial-SC base *)
 
@@ -354,18 +357,15 @@ occur *)-/
   ([M Sc] ⊔ ((hb ?) ⋅ ([F] ⋅ [M Sc]))).-/
 
 def psc_base {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let is_sc : Event c → Prop := fun e => e.mode = Mode.SC
-    let is_f_sc : Event c → Prop := fun e => e.mode = Mode.SC ∧ e.access = PermissionType.fence
-    let M_sc : rlt (Event c) := restrict_rel id_rel is_sc is_sc
+    let M_sc : rlt (Event c) := restrict_rel id_rel
+                                (is_mode {SC}) (is_mode {SC})
 
-    let F_M_sc_opt_hb := restrict_domain (Relation.ReflGen (hb eg)) is_f_sc
+    let F_M_sc_opt_hb := restrict_domain (Relation.ReflGen (hb eg)) ((is_mode {SC}) ∩ (is_type fence))
 
-    let part1 := fun e1 => fun e2 =>
-        M_sc e1 e2 ∨ F_M_sc_opt_hb e1 e2
+    let part1 := M_sc ∪ F_M_sc_opt_hb
 
-    let opt_hb_F_M_sc := restrict_range (Relation.ReflGen (hb eg)) is_f_sc
-    let part3 := fun e1 => fun e2 =>
-        M_sc e1 e2 ∨ opt_hb_F_M_sc e1 e2
+    let opt_hb_F_M_sc := restrict_range (Relation.ReflGen (hb eg)) ((is_mode {SC}) ∩ (is_type fence))
+    let part3 := M_sc ∪ opt_hb_F_M_sc
 
     Rel.comp (Rel.comp part1 (scb eg)) part3
 
@@ -378,13 +378,7 @@ communication relation in some other works on axiomatic memory models *)
 Definition eco := ((rf ex) ⊔ (mo ex) ⊔ rb)^+.-/
 
 def eco {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let union : rlt (Event c) :=
-        fun e1 =>
-            fun e2 =>
-                eg.rf e1 e2 ∨
-                eg.mo e1 e2 ∨
-                (rb eg) e1 e2
-
+    let union := eg.rf ∪ eg.mo ∪ (rb eg)
     Relation.TransGen union
 
 
@@ -398,15 +392,12 @@ Definition psc_fence :=
 -/
 
 def psc_fence {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let f_sc_filter : Event c → Prop :=
-        fun e => e.access = PermissionType.fence ∧ e.mode = SC
     let hb_eco_hb := Rel.comp (Rel.comp (hb eg) (eco eg)) (hb eg)
-    let union : rlt (Event c) :=
-        fun e1 =>
-            fun e2 =>
-                (hb eg) e1 e2 ∨ hb_eco_hb e1 e2
+    let union : rlt (Event c) := (hb eg) ∪ (hb_eco_hb)
 
-    restrict_rel union f_sc_filter f_sc_filter
+    restrict_rel union
+        ((is_mode {SC}) ∩ (is_type fence))
+        ((is_mode {SC}) ∩ (is_type fence))
 
 
 /-(** ** Partial SC *)
@@ -415,9 +406,7 @@ Definition psc :=
   psc_base ⊔ psc_fence.-/
 
 def psc {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    fun e1 =>
-        fun e2 =>
-            (psc_base eg) e1 e2 ∨ (psc_fence eg) e1 e2
+    (psc_base eg) ∪ (psc_fence eg)
 
 ---------------------------------------------------------------------
 /-C11 Axioms-------------------------------------------------------/
@@ -438,12 +427,13 @@ Definition atomicity :=
   forall x y, ~ ((rmw ex) ⊓ ((rb ex) ⋅ (mo ex))) x y.-/
 
 def atomicity {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
-    let rmw_and_rb_mo : rlt (Event c) :=
-        fun e1 =>
-            fun e2 =>
-                eg.rmw e1 e2 ∧
-                (Rel.comp (rb eg) eg.mo) e1 e2
-    forall x y, ¬ rmw_and_rb_mo x y
+    -- let rmw_and_rb_mo : rlt (Event c) :=
+    --     fun e1 =>
+    --         fun e2 =>
+    --             eg.rmw e1 e2 ∧
+    --             (Rel.comp (rb eg) eg.mo) e1 e2
+    -- forall x y, ¬ rmw_and_rb_mo x y
+    (eg.rmw ∩ (Rel.comp (rb eg) (eg.mo))) = ∅ -- error in old version of Rel
 
 /-(** ** SC *)
 
@@ -487,44 +477,3 @@ Definition rc11_consistent :=
   coherence /\ atomicity /\ SC /\ no_thin_air.-/
 def rc11_consistent {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
     coherence eg ∧ atomicity eg ∧ SC eg ∧ no_thin_air eg
-
-
-
-
-------------------------------------------------------------------
-/-Some lemmas from coq---------------------------------------------/
-------------------------------------------------------------------
-
-/-(** In a coherent execution, [hb] is irreflexive. This means that an event
-should not occur before itself. *)
-
-Lemma coherence_irr_hb:
-  coherence -> (forall x, ~hb x x).
-Proof.
-  intros H x Hnot.
-  apply (H x). exists x.
-  - auto.
-  - right. simpl; auto.
-Qed.-/
-lemma coherence_irr_hb {c : SystemConfig} (eg : ExecutionGraph c) : coherence eg → (forall x, ¬ (hb eg) x x) := by
-    intros H x Hnot  -- H: forall x, ¬ (hb ∘ (eco?)) x x
-    apply H x           -- x is st hb x x (proving by contradiction with Hnot, i assume)
-    use x
-    -- constructor
-    -- · exact Hnot
-    -- · apply Relation.reflTransGen.refl
-
-/-(** sequenced-before is included in happens-before *)
-
-Lemma sb_incl_hb:
-  sb ex ≦ hb.
-Proof.
-  unfold hb. kat.
-Qed.-/
-
-lemma sb_incl_hb {c : SystemConfig} (eg : ExecutionGraph c) :
-    ∀ (e1 e2 : Event c), eg.sb e1 e2 → (hb eg) e1 e2 := by
-        unfold hb
-        intros e1 e2 h
-        constructor
-        · exact Or.intro_left ((sw eg) e1 e2) h
