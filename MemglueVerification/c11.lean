@@ -210,17 +210,17 @@ def valid_exec_graph {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
 def restrict_domain {c : SystemConfig} (r : rlt (Event c)) (p : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
-            r e1 e2 ∧ p e1
+            r e1 e2 ∧ e1 ∈ p
 
 def restrict_range {c : SystemConfig} (r : rlt (Event c)) (q : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
-            r e1 e2 ∧ q e2
+            r e1 e2 ∧ e2 ∈ q
 
 def restrict_rel {c : SystemConfig} (r : rlt (Event c)) (p q : Set (Event c)) : rlt (Event c) :=
     fun e1 =>
         fun e2 =>
-            r e1 e2 ∧ p e1 ∧ q e2
+            r e1 e2 ∧ e1 ∈ p ∧ e2 ∈ q
 
 def id_rel {c : SystemConfig} : rlt (Event c) :=
     fun x y => x = y
@@ -251,6 +251,8 @@ Definition rs  :=
   [W] ⋅ (res_eq_loc (sb ex)) ? ⋅ [W] ⋅ [Mse Rlx] ⋅ ((rf ex) ⋅ (rmw ex)) ^*.-/
 set_option diagnostics true
 
+local infixr:90 " • " => Rel.comp
+
 def rs {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let optional_sb : rlt (Event c) := Relation.ReflGen (res_eq_loc eg.sb)
 
@@ -259,10 +261,10 @@ def rs {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
             (is_type store)
             ((is_type store) ∩ (is_mode (geq_mode_set RLX)))
 
-    let rf_rmw := Rel.comp eg.rf eg.rmw
+    let rf_rmw := eg.rf • eg.rmw
     let iter := Relation.ReflTransGen rf_rmw
 
-    Rel.comp W_sb_opt_atomic_W iter
+    W_sb_opt_atomic_W • iter
 
 
 /-(** ** Synchronises with *)
@@ -275,12 +277,16 @@ in case [b] is a fence, a [sb]-prior read) reads from the release sequence of
   [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx] ⋅
   ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq].-/
 
+def example_rel1 : Nat → Nat → Prop := fun x y => x = 0 ∧ y = 1
+def example_rel2 : Nat → Nat → Prop := fun x y => x = 1 ∧ y = 2
+def example_rel3 : Nat → Nat → Prop := fun x y => x = 2 ∧ y = 3
+#check Rel.comp (Rel.comp example_rel1 example_rel2) example_rel3 0 3   -- checking that • is working properly..
 
 def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_domain eg.sb (is_type fence))
 
     -- [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx]
-    let opt_f_sb_rs_rf := (Rel.comp ((Rel.comp optional_fence_sb (rs eg))) eg.rf)
+    let opt_f_sb_rs_rf :=  optional_fence_sb • (rs eg) • eg.rf
     let base :=
         restrict_rel opt_f_sb_rs_rf
             (is_mode (geq_mode_set REL))
@@ -291,7 +297,7 @@ def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let opt_sb_f_geq_acq := restrict_range optional_sb_fence
                             (is_mode (geq_mode_set ACQ))
 
-    Rel.comp base opt_sb_f_geq_acq
+    base • opt_sb_f_geq_acq
 
 
 
@@ -305,7 +311,7 @@ Definition rb :=
   (rf ex) ° ⋅ (mo ex).-/
 
 def rb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    Rel.comp (Rel.inv eg.rf) eg.mo
+    (Rel.inv eg.rf) • eg.mo
 
 /-(** ** Happens-before *)
 
@@ -317,11 +323,13 @@ two events consisting of [sb] and [sw] edges *)
 Definition hb  :=
   ((sb ex) ⊔ sw)^+.-/
 
-instance {c : SystemConfig} : Union (rlt (Event c)) :=
-    ⟨fun rel₁ rel₂ e₁ e₂ => rel₁ e₁ e₂ ∨ rel₂ e₁ e₂⟩
+-- instance {c : SystemConfig} : Union (rlt (Event c)) :=
+--     ⟨fun rel₁ rel₂ e₁ e₂ => rel₁ e₁ e₂ ∨ rel₂ e₁ e₂⟩
+-- instance {c : SystemConfig} : Inter (rlt (Event c)) :=
+--     ⟨fun rel₁ rel₂ e₁ e₂ => rel₁ e₁ e₂ ∧ rel₂ e₁ e₂⟩
 
 def hb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let sb_or_sw : rlt (Event c) := eg.sb ∪ (sw eg)
+    let sb_or_sw : rlt (Event c) := eg.sb ⊔ (sw eg)
     Relation.TransGen (sb_or_sw)
 
 
@@ -336,15 +344,15 @@ Definition scb :=
 
  def scb {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let opt1 := eg.sb
-    let opt2 := Rel.comp (Rel.comp (
-        res_neq_loc eg.sb)
-        (hb eg))
+    let opt2 :=
+        res_neq_loc eg.sb •
+        (hb eg) •
         (res_neq_loc eg.sb)
     let opt3 := res_eq_loc (hb eg)
     let opt4 := eg.mo
     let opt5 := rb eg
 
-    opt1 ∪ opt2 ∪ opt3 ∪ opt4 ∪ opt5
+    opt1 ⊔ opt2 ⊔ opt3 ⊔ opt4 ⊔ opt5
 
 /-(** ** Partial-SC base *)
 
@@ -362,12 +370,12 @@ def psc_base {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
 
     let F_M_sc_opt_hb := restrict_domain (Relation.ReflGen (hb eg)) ((is_mode {SC}) ∩ (is_type fence))
 
-    let part1 := M_sc ∪ F_M_sc_opt_hb
+    let part1 := M_sc ⊔ F_M_sc_opt_hb
 
     let opt_hb_F_M_sc := restrict_range (Relation.ReflGen (hb eg)) ((is_mode {SC}) ∩ (is_type fence))
-    let part3 := M_sc ∪ opt_hb_F_M_sc
+    let part3 := M_sc ⊔ opt_hb_F_M_sc
 
-    Rel.comp (Rel.comp part1 (scb eg)) part3
+    part1 • (scb eg) • part3
 
 /-(** ** Extended coherence order *)
 
@@ -378,7 +386,7 @@ communication relation in some other works on axiomatic memory models *)
 Definition eco := ((rf ex) ⊔ (mo ex) ⊔ rb)^+.-/
 
 def eco {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let union := eg.rf ∪ eg.mo ∪ (rb eg)
+    let union := eg.rf ⊔ eg.mo ⊔ (rb eg)
     Relation.TransGen union
 
 
@@ -392,8 +400,8 @@ Definition psc_fence :=
 -/
 
 def psc_fence {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    let hb_eco_hb := Rel.comp (Rel.comp (hb eg) (eco eg)) (hb eg)
-    let union : rlt (Event c) := (hb eg) ∪ (hb_eco_hb)
+    let hb_eco_hb := (hb eg) • (eco eg) • (hb eg)
+    let union : rlt (Event c) := (hb eg) ⊔ (hb_eco_hb)
 
     restrict_rel union
         ((is_mode {SC}) ∩ (is_type fence))
@@ -406,7 +414,7 @@ Definition psc :=
   psc_base ⊔ psc_fence.-/
 
 def psc {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
-    (psc_base eg) ∪ (psc_fence eg)
+    (psc_base eg) ⊔ (psc_fence eg)
 
 ---------------------------------------------------------------------
 /-C11 Axioms-------------------------------------------------------/
@@ -416,7 +424,7 @@ def psc {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
   forall x, ~(hb ⋅ (eco ex) ?) x x.-/
 
 def coherence {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
-    forall x, ¬(Rel.comp (hb eg) (Relation.ReflGen (eco eg))) x x
+    forall x, ¬((hb eg) • (Relation.ReflGen (eco eg))) x x
 
 /-(** ** Atomicity *)
 
@@ -425,15 +433,11 @@ adjacent in [eco]: there is no write event in between *)
 
 Definition atomicity :=
   forall x y, ~ ((rmw ex) ⊓ ((rb ex) ⋅ (mo ex))) x y.-/
-
+def empty_rel {c : SystemConfig} : Event c → Event c → Prop := fun _ _ => False
 def atomicity {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
-    -- let rmw_and_rb_mo : rlt (Event c) :=
-    --     fun e1 =>
-    --         fun e2 =>
-    --             eg.rmw e1 e2 ∧
-    --             (Rel.comp (rb eg) eg.mo) e1 e2
+    -- let rmw_and_rb_mo := (eg.rmw) ∩ (Rel.comp (rb eg) (eg.mo))
     -- forall x y, ¬ rmw_and_rb_mo x y
-    (eg.rmw ∩ (Rel.comp (rb eg) (eg.mo))) = ∅ -- error in old version of Rel
+    (eg.rmw ⊓ ((rb eg) • (eg.mo))) = empty_rel
 
 /-(** ** SC *)
 
@@ -461,10 +465,7 @@ Definition no_thin_air :=
 -/
 
 def no_thin_air {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
-    let sb_or_rf : rlt (Event c) :=
-        fun e1 =>
-            fun e2 =>
-                eg.sb e1 e2 ∨ eg.rf e1 e2
+    let sb_or_rf := (eg.sb) ⊔ (eg.rf)
     acyclic sb_or_rf
 
 
