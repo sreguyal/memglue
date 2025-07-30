@@ -249,7 +249,6 @@ well as all read-modify-write that recursively read from such writes. *)
 
 Definition rs  :=
   [W] ⋅ (res_eq_loc (sb ex)) ? ⋅ [W] ⋅ [Mse Rlx] ⋅ ((rf ex) ⋅ (rmw ex)) ^*.-/
-set_option diagnostics true
 
 local infixr:90 " • " => Rel.comp
 
@@ -276,11 +275,6 @@ in case [b] is a fence, a [sb]-prior read) reads from the release sequence of
 /-Definition sw :=
   [Mse Rel] ⋅ ([F] ⋅ (sb ex)) ? ⋅ rs ⋅ (rf ex) ⋅ [R] ⋅ [Mse Rlx] ⋅
   ((sb ex) ⋅ [F]) ? ⋅ [Mse Acq].-/
-
-def example_rel1 : Nat → Nat → Prop := fun x y => x = 0 ∧ y = 1
-def example_rel2 : Nat → Nat → Prop := fun x y => x = 1 ∧ y = 2
-def example_rel3 : Nat → Nat → Prop := fun x y => x = 2 ∧ y = 3
-#check Rel.comp (Rel.comp example_rel1 example_rel2) example_rel3 0 3   -- checking that • is working properly..
 
 def sw {c : SystemConfig} (eg : ExecutionGraph c) : rlt (Event c) :=
     let optional_fence_sb : rlt (Event c) := Relation.ReflGen (restrict_domain eg.sb (is_type fence))
@@ -465,8 +459,7 @@ Definition no_thin_air :=
 -/
 
 def no_thin_air {c : SystemConfig} (eg : ExecutionGraph c) : Prop :=
-    let sb_or_rf := (eg.sb) ⊔ (eg.rf)
-    acyclic sb_or_rf
+    acyclic ((eg.sb) ⊔ (eg.rf))
 
 
 /-(** ** RC11-consistent executions *)

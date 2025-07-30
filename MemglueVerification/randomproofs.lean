@@ -121,3 +121,23 @@ example (h : ¬ ∀ x, ¬ p x) : ∃ x, p x :=
         have h4 : ∃ x, p x := ⟨x, h3⟩
         show False from h1 h4
       show False from h h2)
+
+
+example (p q r : Prop) : p ∧ (q ∨ r) ↔ (p ∧ q) ∨ (p ∧ r) := by
+  apply Iff.intro
+  case mp =>
+    intro h
+    apply Or.elim (And.right h)
+    case left =>
+      intro hq
+      have h_left : p ∧ q := by
+        apply And.intro h.left hq
+      apply Or.inl h_left
+    case right => sorry
+  case mpr => sorry
+
+example (p q : Prop) : p ∨ q → q ∨ p := by
+  intro h
+  cases h with
+  | inl hp => apply Or.inr; exact hp
+  | inr hq => apply Or.inl; exact hq
