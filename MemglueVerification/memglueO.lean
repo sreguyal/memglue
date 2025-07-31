@@ -45,6 +45,7 @@ structure Message (c : SystemConfig) : Type where
     addr : Addr c := 0
     ts : Timestamp := 0
     stren : OpStrength := OpStrength.RLX
+    id : Nat := 0               -- ids are assigned to each message received at a node in increasing order so that we can track orderedness of network
 deriving Repr
 
 instance (c : SystemConfig) : Inhabited (Message c) where
@@ -56,10 +57,13 @@ instance (c : SystemConfig) : Inhabited (Message c) where
         addr := 0
         ts := 0
         stren := OpStrength.RLX
+        id := 0
     }
 
+
+abbrev MessageIds (c : SystemConfig) : Type := Vector Nat (c.threads + 1)
 -- matrix one row of messages per node (CC + shims)
-def NETOrdered (c : SystemConfig) : Type := Vector (List (Message c)) (c.threads + 1)
+abbrev NETOrdered (c : SystemConfig) : Type := Vector (List (Message c)) (c.threads + 1)
 instance (c : SystemConfig) : Inhabited (NETOrdered c) where default := Vector.replicate (c.threads + 1) (List.nil)
 instance (c : SystemConfig) [Repr (List (Message c))] : Repr (NETOrdered c) where
   reprPrec net _ := repr (net.toList)
@@ -96,12 +100,12 @@ instance (c : SystemConfig) : Inhabited (CCElemState c) where
         sharers := Vector.replicate c.threads false -- make this true for store buffer test
         }
 
-def ShimCache (c : SystemConfig) : Type := List.Vector ShimElemState c.addrCount
-instance (c : SystemConfig) : Inhabited (ShimCache c) where default := List.Vector.replicate c.addrCount (default : ShimElemState)
+abbrev ShimCache (c : SystemConfig) : Type := Vector ShimElemState c.addrCount
+instance (c : SystemConfig) : Inhabited (ShimCache c) where default := Vector.replicate c.addrCount (default : ShimElemState)
 instance (c : SystemConfig) [Repr ShimElemState] : Repr (ShimCache c) where
   reprPrec cache _ := repr (cache.toList)
 
-def CCCache (c : SystemConfig) : Type := Vector (CCElemState c) c.addrCount
+abbrev CCCache (c : SystemConfig) : Type := Vector (CCElemState c) c.addrCount
 instance (c : SystemConfig) : Inhabited (CCCache c) where default := Vector.replicate c.addrCount (default : CCElemState c)
 instance (c : SystemConfig) [Repr (CCElemState c)] : Repr (CCCache c) where
     reprPrec cache _ := repr (cache.toList)
@@ -154,13 +158,17 @@ structure CCMachine (c : SystemConfig) : Type where
     cache : CCCache c
 deriving Inhabited, Repr
 
-def ShimType (c : SystemConfig) : Type := List.Vector (Shim c) c.threads
-instance (c : SystemConfig) : Inhabited (ShimType c) where default := List.Vector.replicate c.threads (default : Shim c)
+universe u
+instance {α : Type u} {n : ℕ} : GetElem (Vector α n) ℕ α (fun _ i => i < n) where
+  getElem v i h := v.get ⟨i, h⟩
+
+abbrev ShimType (c : SystemConfig) : Type := Vector (Shim c) c.threads
+instance (c : SystemConfig) : Inhabited (ShimType c) where default := Vector.replicate c.threads (default : Shim c)
 instance (c : SystemConfig) [Repr (Shim c)] : Repr (ShimType c) where
   reprPrec shims _ := repr (shims.toList)
 #eval (default : ShimType (default : SystemConfig))
 
-universe u
+
 -- A single trace is a sequence of operations.
 def Trace (α : Type u) (steps : Nat) := Fin steps → α
 
@@ -225,7 +233,7 @@ theorem protocol_respects_coherence :
 --                 (target : Node) ()
 
 def netWithAddedMsg {c : SystemConfig} (msg : Message c) (net : NETOrdered c) : NETOrdered c :=
-    let oldList : List (Message c) := net.get msg.dst
+    let oldList : List (Message c) := net[msg.dst]
     let updatedList : List (Message c) := oldList.append [msg]
     let updatedNet : NETOrdered c := net.set msg.dst.val updatedList
     updatedNet
@@ -256,7 +264,7 @@ def testnet := sendFence MType.EVICT (0 : Node (default : SystemConfig)) (1 : No
 #eval testnet
 
 def popMessage {c : SystemConfig} (dst : Node c) (net : NETOrdered c) : NETOrdered c :=
-    let oldList : List (Message c) := net.get dst
+    let oldList : List (Message c) := net[dst]
     let updatedList : List (Message c) := oldList.tail
     let updatedNet : NETOrdered c := net.set dst.val updatedList
     updatedNet
@@ -270,8 +278,8 @@ def popMessage {c : SystemConfig} (dst : Node c) (net : NETOrdered c) : NETOrder
 def updateVal {c : SystemConfig} (targetThread : ShimId c) (data : Data)
     (e : Execution c) (shimVec : ShimType c)
     : Execution c :=
-    let targetStep : QInd c := (shimVec.get targetThread).qInd
-    let stepCount := (shimVec.get targetThread).qCnt
+    let targetStep : QInd c := (shimVec[targetThread]).qInd
+    let stepCount := (shimVec[targetThread]).qCnt
     -- qCnt?
     if (targetStep.val < stepCount.val) ∧ ((e targetThread targetStep).access ≠ PermissionType.none) then
         -- update output
@@ -304,8 +312,8 @@ def testNoChange := updateVal (1 : ShimId (default)) 10 (default : Execution (de
 def popInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
     : (ShimType c) × (Execution c) :=
 
-    let qInd := (shimVec.get shim).qInd
-    let qCnt := (shimVec.get shim).qCnt
+    let qInd := (shimVec[shim]).qInd
+    let qCnt := (shimVec[shim]).qCnt
     let newExec : Execution c :=       -- still a function but for that thread instruction, pend = false
         fun (t : ShimId c) =>
             fun (s : Fin c.steps) =>
@@ -317,14 +325,14 @@ def popInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Ex
         let nextQInd : QInd c := ⟨qInd.val + 1, h⟩
         -- CHECK: changed nextQInd = qCnt to nextQInd > qEnd
         let shimInactive : Prop := nextQInd.val = qCnt.val ∨ (e shim nextQInd).access = PermissionType.none
-        let newActiveState : Bool := if shimInactive then false else (shimVec.get shim).active
-        let newShim : Shim c := {(shimVec.get shim) with qInd := nextQInd, active := newActiveState}
+        let newActiveState : Bool := if shimInactive then false else (shimVec[shim]).active
+        let newShim : Shim c := {(shimVec[shim]) with qInd := nextQInd, active := newActiveState}
         let newShimVec : ShimType c := shimVec.set shim newShim
 
         (newShimVec, newExec)
     else
         -- qInd + 1 is out of range, i.e. after pop, shim should def be inactive
-        let newShim : Shim c := {(shimVec.get shim) with active := false}
+        let newShim : Shim c := {(shimVec[shim]) with active := false}
         let newShimVec : ShimType c := shimVec.set shim newShim
 
         (newShimVec, newExec)
@@ -335,9 +343,9 @@ def popInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Ex
 def shimWriteCache {c : SystemConfig} (shim : ShimId c) (state' : CacheState)
     (data' : Data) (ts' : Timestamp) (addr : Addr c) (shimVec : ShimType c)
     : ShimType c :=
-    let curShimCache : ShimCache c := (shimVec.get shim).state
-    let newCacheState : ShimCache c := curShimCache.set addr {curShimCache.get addr with state := state', data := data', ts := ts'}
-    let newShim := {shimVec.get shim with state := newCacheState}
+    let curShimCache : ShimCache c := (shimVec[shim]).state
+    let newCacheState : ShimCache c := curShimCache.set addr {curShimCache[addr] with state := state', data := data', ts := ts'}
+    let newShim := {shimVec[shim] with state := newCacheState}
     let newShimVec := shimVec.set shim newShim
 
     newShimVec
@@ -345,9 +353,9 @@ def shimWriteCache {c : SystemConfig} (shim : ShimId c) (state' : CacheState)
 #eval shimWriteCache (1 : ShimId default) (CacheState.Valid) (10 : Data) (20 : Timestamp) (0 : Addr default) (default : ShimType default)
 
 def shimIncrTS {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (shimVec : ShimType c) : ShimType c :=
-    let curShimCache : ShimCache c := (shimVec.get shim).state
-    let newCacheState : ShimCache c := curShimCache.set addr {curShimCache.get addr with ts := (curShimCache.get addr).ts + 1}
-    let newShim := {shimVec.get shim with state := newCacheState}
+    let curShimCache : ShimCache c := (shimVec[shim]).state
+    let newCacheState : ShimCache c := curShimCache.set addr {curShimCache[addr] with ts := (curShimCache[addr]).ts + 1}
+    let newShim := {shimVec[shim] with state := newCacheState}
     let newShimVec := shimVec.set shim newShim
 
     newShimVec
@@ -361,50 +369,50 @@ def shimReceive {c : SystemConfig} (msg : Message c)
                 : (ShimType c) × (Execution c) :=
     if h1 : msg.dst < c.threads.val then    -- msg.dst is in fact a shim
         let curShim : ShimId c := ⟨msg.dst, h1⟩
-        let curShimCache : ShimCache c := (shimVec.get curShim).state
+        let curShimCache : ShimCache c := (shimVec[curShim]).state
         let addr := msg.addr
 
         match msg.mtype with
             | MType.WRITE =>
-                let shimElem : ShimElemState := curShimCache.get addr
+                let shimElem : ShimElemState := curShimCache[addr]
                 if msg.ts > shimElem.ts then
                     (shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec, e)
                 else
                     (shimIncrTS curShim addr shimVec, e)
             | MType.WRITE_ACK =>
-                let shimElem : ShimElemState := curShimCache.get addr
+                let shimElem : ShimElemState := curShimCache[addr]
                 if shimElem.syncBit = true then
                     let newTs : Timestamp := msg.ts+shimElem.ts-1
                     let modShims : ShimType c := shimWriteCache curShim CacheState.Valid shimElem.data newTs addr shimVec
-                    let modShimElem : ShimElemState := {(modShims.get curShim).state.get addr with syncBit := false}
-                    let modShimCache : ShimCache c := (modShims.get curShim).state.set addr modShimElem
-                    let modShim : Shim c := {(modShims.get curShim) with state := modShimCache, pendingWSC := false}
+                    let modShimElem : ShimElemState := {(modShims[curShim]).state[addr] with syncBit := false}
+                    let modShimCache : ShimCache c := (modShims[curShim]).state.set addr modShimElem
+                    let modShim : Shim c := {(modShims[curShim]) with state := modShimCache, pendingWSC := false}
 
                     let newShimVec : ShimType c := modShims.set curShim modShim
                     (newShimVec, e)
                 else
-                    let modShim : Shim c := {(shimVec.get curShim) with pendingWSC := false}
+                    let modShim : Shim c := {(shimVec[curShim]) with pendingWSC := false}
                     let newShimVec : ShimType c := shimVec.set curShim modShim
                     (newShimVec, e)
             | MType.RRESP =>
                 let modShims : ShimType c := shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec
-                let modShimElem : ShimElemState := {(modShims.get curShim).state.get addr with syncBit := false}
-                let modShimCache : ShimCache c := (modShims.get curShim).state.set addr modShimElem
-                let modShim : Shim c := {(modShims.get curShim) with state := modShimCache}
+                let modShimElem : ShimElemState := {(modShims[curShim]).state[addr] with syncBit := false}
+                let modShimCache : ShimCache c := (modShims[curShim]).state.set addr modShimElem
+                let modShim : Shim c := {(modShims[curShim]) with state := modShimCache}
                 let modShims' : ShimType c := modShims.set curShim modShim
 
                 let e' : Execution c := updateVal curShim msg.data e shimVec
                 let (newShimVec, e'') := popInstr curShim modShims' e'
                 (newShimVec, e'')
             | MType.FRESP =>
-                let modShim : Shim c := {(shimVec.get curShim) with fencePending := false}
+                let modShim : Shim c := {(shimVec[curShim]) with fencePending := false}
                 let modShimVec : ShimType c := shimVec.set curShim modShim
 
-                if (shimVec.get curShim).pendingWSC = false then
+                if (shimVec[curShim]).pendingWSC = false then
                     let (newShimVec, newExec) := popInstr curShim modShimVec e
                     (newShimVec, newExec)
                 else
-                    let modShim' := {(shimVec.get curShim) with pendingWSC := false}
+                    let modShim' := {(shimVec[curShim]) with pendingWSC := false}
                     let newShimVec : ShimType c := modShimVec.set curShim modShim'
                     (newShimVec, e)
             | _ => panic! "message with wrong message type was passed into ShimReceive"
@@ -413,7 +421,7 @@ def shimReceive {c : SystemConfig} (msg : Message c)
 
 def shimReceiveAndPopMsg {c : SystemConfig} (shim : ShimId c) (state : IncState c) : IncState c :=
     let shimNode : Node c := shim.castSucc
-    let msg := (state.net.get shimNode).head!
+    let msg := (state.net[shimNode]).head!
     let (shimVec', e') := shimReceive msg state.shimVec state.execution
     let state' := {state with shimVec := shimVec', execution := e'}
 
@@ -427,7 +435,7 @@ def shimReceiveAndPopMsg {c : SystemConfig} (shim : ShimId c) (state : IncState 
 def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength)
               (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) :
               (ShimType c) × (Execution c) × (NETOrdered c) :=
-            let newTs : Timestamp := ((shimVec.get shim).state.get addr).ts + 1
+            let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
             let (shimVec', e') := popInstr shim shimVec e
             let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
 
@@ -437,7 +445,7 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
 
             let net' := send MType.WRITE shimNode CCNode data addr newTs stren net
             if stren = OpStrength.SC then
-                let modShim := {shimVec''.get shim with pendingWSC := true}
+                let modShim := {shimVec''[shim] with pendingWSC := true}
                 let shimVec''' := shimVec''.set shim modShim
                 (shimVec''', e', net')
             else
@@ -447,7 +455,7 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
 def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
     (shimVec : ShimType c) (net : NETOrdered c) (e : Execution c) :
     (ShimType c) × (NETOrdered c) × (Execution c) :=
-    let shimElem := ((shimVec.get shim).state).get addr
+    let shimElem := ((shimVec[shim]).state)[addr]
     if shimElem.state ≠ CacheState.Valid then
         let shimNode := shim.castSucc
         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
@@ -461,7 +469,7 @@ def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStr
 --   -- Stop local reads until FRESP received
 def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETOrdered c) :
     (ShimType c) × (NETOrdered c) :=
-        let modShim := {shimVec.get shim with fencePending := true}
+        let modShim := {shimVec[shim] with fencePending := true}
         let shimVec' := shimVec.set shim modShim
 
         let shimNode := shim.castSucc
@@ -475,16 +483,16 @@ def CCSendMsgToSharers {c : SystemConfig} (potentialSharer : Nat) (msg : Message
         if h : potentialSharer < c.threads then
             match potentialSharer with
             | 0 =>
-                if 0 ≠ msg.src ∧ (CC.cache.get msg.addr).sharers.get 0 = true then
-                    send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+                if 0 ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[0] = true then
+                    send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net
                 else
                     net
             | ps + 1 =>
                 let curShim : ShimId c := ⟨ps + 1, h⟩
                 let curNode : Node c := curShim.castSucc
                 let next := ps
-                if curNode ≠ msg.src ∧ (CC.cache.get msg.addr).sharers.get curShim = true then
-                    let net' := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+                if curNode ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[curShim] = true then
+                    let net' := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net
                     CCSendMsgToSharers next msg net' CC
                 else
                     CCSendMsgToSharers next msg net CC
@@ -496,8 +504,8 @@ def cceveryonesharers := {(default : CCMachine default) with cache := (default :
 
 def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
     if h : msg.src < c.threads.val then
-        let sharerVec' := (CC.cache.get msg.addr).sharers.set msg.src true
-        let CCElemData' := {(CC.cache.get msg.addr) with sharers := sharerVec'}
+        let sharerVec' := (CC.cache[msg.addr]).sharers.set msg.src true
+        let CCElemData' := {(CC.cache[msg.addr]) with sharers := sharerVec'}
         let CCCache' := CC.cache.set msg.addr CCElemData'
         let CC' := {CC with cache := CCCache'}
         CC'
@@ -510,7 +518,7 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
     | MType.WRITE =>
         if h : msg.src < c.threads.val then
             -- write data, increment ts
-            let CCElemData' : CCElemState c := {(CC.cache.get msg.addr) with data := msg.data, ts := (CC.cache.get msg.addr).ts + 1}
+            let CCElemData' : CCElemState c := {(CC.cache[msg.addr]) with data := msg.data, ts := (CC.cache[msg.addr]).ts + 1}
             let CCCache' : CCCache c := CC.cache.set msg.addr CCElemData'
             let CC' : CCMachine c := {CC with cache := CCCache'}
 
@@ -520,8 +528,8 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
             -- If SC or first write, send write acknowledgement
             let msgSrcShim : ShimId c := ⟨msg.src, h⟩
             let net'' :=
-                if msg.stren = OpStrength.SC ∨ (CC'.cache.get msg.addr).sharers.get msgSrcShim = false then
-                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache.get msg.addr).ts msg.stren net'
+                if msg.stren = OpStrength.SC ∨ (CC'.cache[msg.addr]).sharers[msgSrcShim] = false then
+                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net'
                 else net'
 
             -- add src to sharers
@@ -535,7 +543,7 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
             panic! "source of message to the CC was the CC??"
     | MType.RREQ =>
         let CC' := CCAddSrcShimToSharers CC msg
-        let net' := send MType.RRESP CCNode msg.src (CC.cache.get msg.addr).data msg.addr (CC.cache.get msg.addr).ts msg.stren net
+        let net' := send MType.RRESP CCNode msg.src (CC.cache[msg.addr]).data msg.addr (CC.cache[msg.addr]).ts msg.stren net
         (CC', net')
     | MType.FREQ => --SendFence(FRESP,0,msg.src);
         let net' := sendFence MType.FRESP CCNode msg.src net
@@ -544,7 +552,7 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
 
 def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
     let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
-    let msg := (state.net.get CCNode).head!
+    let msg := (state.net[CCNode]).head!
     let (cc', net') := CCReceive msg state.cc state.net
     let state' := {state with cc := cc', net := net'}
 
@@ -554,7 +562,7 @@ def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
 
 def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
 : (Execution c) × (Instr c) :=
-    let qInd := (shimVec.get shim).qInd
+    let qInd := (shimVec[shim]).qInd
     let e' :=
         fun (t : ShimId c) =>
             fun (s : Fin c.steps) =>
@@ -582,7 +590,7 @@ def getAndIssueInstr {c : SystemConfig} (shim : ShimId c) (state : IncState c) :
     | _ => panic! "IssueInstr got instruction that wasn't load/store/fence"
 
 def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : Prop :=
-    let shimStruct := state.shimVec.get shimId
+    let shimStruct := state.shimVec[shimId]
     (
         shimStruct.active = true ∧
         shimStruct.fencePending = false ∧
@@ -607,7 +615,7 @@ def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : 
 -- negation of all the preconditions to first three constructors of increment_step
 def isDone {c : SystemConfig} (state : IncState c) : Prop :=
     let CCNode : Node c := ⟨c.threads, c.threads.lt_succ_self⟩
-    (state.net.get CCNode).length = 0 ∧ forall (shim : ShimId c), ¬ canIssueInstr shim state ∧ (state.net.get (shim.castSucc)).length = 0
+    (state.net[CCNode]).length = 0 ∧ forall (shim : ShimId c), ¬ canIssueInstr shim state ∧ (state.net[(shim.castSucc)]).length = 0
 
 inductive increment_step {c : SystemConfig} : IncState c → IncState c → Prop where
     | ProcessInstr : forall (s s' : IncState c) (shim : ShimId c),
@@ -615,11 +623,11 @@ inductive increment_step {c : SystemConfig} : IncState c → IncState c → Prop
                 s' = getAndIssueInstr shim s →
                 increment_step s s'
     | ShimProcessMsg : forall (s s' : IncState c) (shim : ShimId c),
-                (s.net.get (shim.castSucc)).length > 0 →
+                (s.net[(shim.castSucc)]).length > 0 →
                 s' = shimReceiveAndPopMsg shim s →
                 increment_step s s'
     | CCProcessMsg : forall (s s' : IncState c),
-                (s.net.get ⟨c.threads, c.threads.lt_succ_self⟩).length > 0 →
+                (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)]).length > 0 →
                 s' = CCReceiveAndPopMsg s →
                 increment_step s s'
     | Finish : forall (s s' : IncState c),
@@ -641,6 +649,9 @@ inductive increment_reachable {c : SystemConfig} : IncState c → Prop where
         increment_reachable s →
         increment_step s s' →
         increment_reachable s'
+
+def end_state {c : SystemConfig} (s : IncState c) : Prop :=
+  s.done = true ∧ increment_reachable s
 
 -- example
 -- namespace small_example
