@@ -161,6 +161,8 @@ deriving Inhabited, Repr
 universe u
 instance {α : Type u} {n : ℕ} : GetElem (Vector α n) ℕ α (fun _ i => i < n) where
   getElem v i h := v.get ⟨i, h⟩
+instance {α : Type u} : GetElem (List α) ℕ α (fun v i => i < v.length) where
+  getElem v i h := v.get ⟨i, h⟩
 
 abbrev ShimType (c : SystemConfig) : Type := Vector (Shim c) c.threads
 instance (c : SystemConfig) : Inhabited (ShimType c) where default := Vector.replicate c.threads (default : Shim c)
@@ -190,6 +192,7 @@ structure IncState (c : SystemConfig) where
     cc : CCMachine c
     shimVec : ShimType c
     net : NETOrdered c
+    msgIds : MessageIds c
     execution : Execution c
     -- output : Output c
     done : Bool
@@ -243,25 +246,27 @@ def netWithAddedMsg {c : SystemConfig} (msg : Message c) (net : NETOrdered c) : 
 
 def send {c : SystemConfig} (mtype' : MType) (src' : Node c) (dst' : Node c)
          (data' : Data) (addr' : Addr c) (ts' : Timestamp) (stren' : OpStrength)
-         (net : NETOrdered c)
-         : NETOrdered c :=
+         (net : NETOrdered c) (msgIds : MessageIds c)
+         : NETOrdered c × MessageIds c :=
 
-        let msg : (Message c) := {mtype := mtype', src := src', dst := dst', data := data', addr := addr', ts := ts', stren := stren'}
-        netWithAddedMsg msg net
+        let msg : (Message c) := {mtype := mtype', src := src', dst := dst', data := data', addr := addr', ts := ts', stren := stren', id := msgIds[dst']}
+        let msgIds' := msgIds.set dst' (msgIds[dst'] + 1)
+        (netWithAddedMsg msg net, msgIds')
 
-#eval send MType.EVICT (1 : Node (default : SystemConfig)) (0 : Node (default : SystemConfig)) 10 0 100 OpStrength.ACQ (default : NETOrdered (default : SystemConfig))
+-- def res := send MType.EVICT (1 : Node (default : SystemConfig)) (0 : Node (default : SystemConfig)) 10 0 100 OpStrength.ACQ default (default : NETOrdered (default : SystemConfig))
+-- #eval send MType.EVICT (1 : Node (default : SystemConfig)) (0 : Node (default : SystemConfig)) 10 0 100 OpStrength.ACQ res.1 res.2
 
-def sendFence {c : SystemConfig} (mtype' : MType) (src' : Node c) (dst' : Node c) (net : NETOrdered c) : NETOrdered c :=
-    let msg : (Message c) := {(default : Message c) with mtype := mtype', src := src', dst := dst'}
-                            --   remaining don't matter ↓
-                            --   data := 0,
-                            --   addr := none,
-                            --   ts := 0,
-                            --   stren := OpStrength.RLX,
-    netWithAddedMsg msg net
+def sendFence {c : SystemConfig} (mtype' : MType) (src' : Node c) (dst' : Node c) (net : NETOrdered c) (msgIds : MessageIds c)
+: NETOrdered c × MessageIds c:=
+    let msg : (Message c) := {(default : Message c) with mtype := mtype', src := src', dst := dst', id := msgIds[dst']}
+    let msgIds' := msgIds.set dst' (msgIds[dst'] + 1)
+    (netWithAddedMsg msg net, msgIds')
 
-def testnet := sendFence MType.EVICT (0 : Node (default : SystemConfig)) (1 : Node (default : SystemConfig)) (default : NETOrdered (default : SystemConfig))
-#eval testnet
+-- def res := sendFence MType.EVICT (1 : Node (default : SystemConfig)) (0 : Node (default : SystemConfig)) default default
+-- #eval sendFence MType.EVICT (1 : Node (default : SystemConfig)) (0 : Node (default : SystemConfig)) res.1 res.2
+
+-- def testnet := sendFence MType.EVICT (0 : Node (default : SystemConfig)) (1 : Node (default : SystemConfig)) (default : NETOrdered (default : SystemConfig))
+-- #eval testnet
 
 def popMessage {c : SystemConfig} (dst : Node c) (net : NETOrdered c) : NETOrdered c :=
     let oldList : List (Message c) := net[dst]
@@ -269,12 +274,10 @@ def popMessage {c : SystemConfig} (dst : Node c) (net : NETOrdered c) : NETOrder
     let updatedNet : NETOrdered c := net.set dst.val updatedList
     updatedNet
 
-#eval popMessage (2 : Node (default : SystemConfig)) (default : NETOrdered (default : SystemConfig))
-#eval popMessage (1 : Node (default : SystemConfig)) testnet
+-- #eval popMessage (2 : Node (default : SystemConfig)) (default : NETOrdered (default : SystemConfig))
+-- #eval popMessage (1 : Node (default : SystemConfig)) testnet
 
--- NOTES: changed data to be in Nat, rather than original Data. shim : Fin nThreads = ShimId (zero indexed now)
 -- Update output of litmus test load
--- CHECK changes: replaced qCnt with qEnd (index of last instruction for each thread) because with qCnt, we had to have QCnt type be Fin (c.steps + 1) to cover case where qCnt = c.steps (which should be allowed). Because of this, I changed the if conditional to check for targetStep <= endStep, rather than <.
 def updateVal {c : SystemConfig} (targetThread : ShimId c) (data : Data)
     (e : Execution c) (shimVec : ShimType c)
     : Execution c :=
@@ -433,8 +436,8 @@ def shimReceiveAndPopMsg {c : SystemConfig} (shim : ShimId c) (state : IncState 
 -- SHIM: outgoing messages
 -- Write value, or send WRITE to CC
 def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength)
-              (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) :
-              (ShimType c) × (Execution c) × (NETOrdered c) :=
+              (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) (msgIds : MessageIds c):
+              (ShimType c) × (Execution c) × (NETOrdered c) × (MessageIds c) :=
             let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
             let (shimVec', e') := popInstr shim shimVec e
             let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
@@ -443,64 +446,67 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
             let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
             -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
 
-            let net' := send MType.WRITE shimNode CCNode data addr newTs stren net
+            let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren net msgIds
             if stren = OpStrength.SC then
                 let modShim := {shimVec''[shim] with pendingWSC := true}
                 let shimVec''' := shimVec''.set shim modShim
-                (shimVec''', e', net')
+                (shimVec''', e', net', msgIds')
             else
-                (shimVec'', e', net')
+                (shimVec'', e', net', msgIds')
 -- mp
 -- Read value, or send RREQ to CC
 def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
-    (shimVec : ShimType c) (net : NETOrdered c) (e : Execution c) :
-    (ShimType c) × (NETOrdered c) × (Execution c) :=
+    (shimVec : ShimType c) (net : NETOrdered c) (e : Execution c) (msgIds : MessageIds c) :
+    (ShimType c) × (NETOrdered c) × (Execution c) × (MessageIds c):=
     let shimElem := ((shimVec[shim]).state)[addr]
     if shimElem.state ≠ CacheState.Valid then
         let shimNode := shim.castSucc
         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
-        let net' := send MType.RREQ shimNode CCNode shimElem.data addr shimElem.ts stren net
-        (shimVec, net', e)
+        let (net', msgIds') := send MType.RREQ shimNode CCNode shimElem.data addr shimElem.ts stren net msgIds
+        (shimVec, net', e, msgIds')
     else
         let e' := updateVal shim shimElem.data e shimVec
         let (shimVec', e'') := popInstr shim shimVec e'
-        (shimVec', net, e'')
+        (shimVec', net, e'', msgIds)
 
 --   -- Stop local reads until FRESP received
-def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETOrdered c) :
-    (ShimType c) × (NETOrdered c) :=
+def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETOrdered c) (msgIds : MessageIds c) :
+    (ShimType c) × (NETOrdered c) × (MessageIds c) :=
         let modShim := {shimVec[shim] with fencePending := true}
         let shimVec' := shimVec.set shim modShim
 
         let shimNode := shim.castSucc
         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
-        let net' := sendFence MType.FREQ shimNode CCNode net
-        (shimVec', net')
+        let (net', msgIds') := sendFence MType.FREQ shimNode CCNode net msgIds
+        (shimVec', net', msgIds')
 
   -- CC: process messages -----------------------------------------------------
-def CCSendMsgToSharers {c : SystemConfig} (potentialSharer : Nat) (msg : Message c) (net : NETOrdered c) (CC : CCMachine c) : NETOrdered c :=
+def CCSendMsgToSharers {c : SystemConfig} (potentialSharer : Nat) (msg : Message c) (net : NETOrdered c) (msgIds : MessageIds c) (CC : CCMachine c)
+: NETOrdered c × MessageIds c:=
         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
         if h : potentialSharer < c.threads then
             match potentialSharer with
             | 0 =>
                 if 0 ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[0] = true then
-                    send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net
+                    send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
                 else
-                    net
+                    (net, msgIds)
             | ps + 1 =>
                 let curShim : ShimId c := ⟨ps + 1, h⟩
                 let curNode : Node c := curShim.castSucc
                 let next := ps
                 if curNode ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[curShim] = true then
-                    let net' := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net
-                    CCSendMsgToSharers next msg net' CC
+                    let (net', msgIds') := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
+                    CCSendMsgToSharers next msg net' msgIds' CC
                 else
-                    CCSendMsgToSharers next msg net CC
+                    CCSendMsgToSharers next msg net msgIds CC
         else panic! "potentialSharer passed into CCsendToSharers is not a valid shimId (≥ c.threads)"
 
 #eval (default : NETOrdered default)
 def cceveryonesharers := {(default : CCMachine default) with cache := (default : CCCache default).set 0 {(default : CCElemState default ) with sharers := Vector.mk #[true, true] (by decide)}}
-#eval CCSendMsgToSharers 1 (default : Message default) (default : NETOrdered default) cceveryonesharers
+#eval cceveryonesharers
+#eval CCSendMsgToSharers 1 {(default : Message default) with src := 2} (default : NETOrdered default) default cceveryonesharers
+#eval (cceveryonesharers.cache[0]).sharers[0] = true ∧ 0 ≠ (default : Message default).src
 
 def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
     if h : msg.src < c.threads.val then
@@ -512,7 +518,8 @@ def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c
     else
         panic! "source of message to the CC was the CC??"
 
-def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETOrdered c) : (CCMachine c) × (NETOrdered c) :=
+def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETOrdered c) (msgIds : MessageIds c)
+: (CCMachine c) × (NETOrdered c) × (MessageIds c) :=
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
     match msg.mtype with
     | MType.WRITE =>
@@ -523,14 +530,14 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
             let CC' : CCMachine c := {CC with cache := CCCache'}
 
             -- send write to sharers
-            let net' := CCSendMsgToSharers (c.threads - 1) msg net CC'
+            let (net', msgIds') := CCSendMsgToSharers (c.threads - 1) msg net msgIds CC'
 
             -- If SC or first write, send write acknowledgement
             let msgSrcShim : ShimId c := ⟨msg.src, h⟩
-            let net'' :=
+            let (net'', msgIds'') :=
                 if msg.stren = OpStrength.SC ∨ (CC'.cache[msg.addr]).sharers[msgSrcShim] = false then
-                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net'
-                else net'
+                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net' msgIds'
+                else (net', msgIds')
 
             -- add src to sharers
             -- let sharerVec' := (CC'.cache.get msg.addr).sharers.set msgSrcShim true
@@ -538,23 +545,23 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
             -- let CCCache'' := CC'.cache.set msg.addr CCElemData''
             -- let CC'' := {CC' with cache := CCCache''}
             let CC'' := CCAddSrcShimToSharers CC' msg
-            (CC'', net'')
+            (CC'', net'', msgIds'')
         else
             panic! "source of message to the CC was the CC??"
     | MType.RREQ =>
         let CC' := CCAddSrcShimToSharers CC msg
-        let net' := send MType.RRESP CCNode msg.src (CC.cache[msg.addr]).data msg.addr (CC.cache[msg.addr]).ts msg.stren net
-        (CC', net')
+        let (net', msgIds') := send MType.RRESP CCNode msg.src (CC.cache[msg.addr]).data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
+        (CC', net', msgIds')
     | MType.FREQ => --SendFence(FRESP,0,msg.src);
-        let net' := sendFence MType.FRESP CCNode msg.src net
-        (CC, net')
+        let (net', msgIds') := sendFence MType.FRESP CCNode msg.src net msgIds
+        (CC, net', msgIds')
     | _ => panic! "CC received message of invalid type"
 
 def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
     let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
     let msg := (state.net[CCNode]).head!
-    let (cc', net') := CCReceive msg state.cc state.net
-    let state' := {state with cc := cc', net := net'}
+    let (cc', net', msgIds') := CCReceive msg state.cc state.net state.msgIds
+    let state' := {state with cc := cc', net := net', msgIds := msgIds'}
 
     let net'' := popMessage CCNode state'.net
     let state'' := {state' with net := net''}
@@ -574,18 +581,19 @@ def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Ex
 def getAndIssueInstr {c : SystemConfig} (shim : ShimId c) (state : IncState c) : IncState c :=
     let (e', instr) := getInstr shim state.shimVec state.execution
     let state' := {state with execution := e'}
+
     match instr.access with
     | PermissionType.load =>
-        let (shimVec', net', e'') := shimRead shim instr.addr instr.stren state'.shimVec state'.net state'.execution
-        let state'' := {state' with shimVec := shimVec', net := net', execution := e''}
+        let (shimVec', net', e'', msgIds') := shimRead shim instr.addr instr.stren state'.shimVec state'.net state'.execution state'.msgIds
+        let state'' := {state' with shimVec := shimVec', net := net', execution := e'', msgIds := msgIds'}
         state''
     | PermissionType.store =>
-        let (shimVec', e'', net') := shimWrite shim instr.addr instr.data instr.stren state'.shimVec state'.execution state'.net
-        let state'' := {state' with shimVec := shimVec', execution := e'', net := net'}
+        let (shimVec', e'', net', msgIds') := shimWrite shim instr.addr instr.data instr.stren state'.shimVec state'.execution state'.net state'.msgIds
+        let state'' := {state' with shimVec := shimVec', execution := e'', net := net', msgIds := msgIds'}
         state''
     | PermissionType.fence =>
-        let (shimVec', net') := shimFence shim state'.shimVec state'.net
-        let state'' := {state' with shimVec := shimVec', net := net'}
+        let (shimVec', net', msgIds') := shimFence shim state'.shimVec state'.net state'.msgIds
+        let state'' := {state' with shimVec := shimVec', net := net', msgIds := msgIds'}
         state''
     | _ => panic! "IssueInstr got instruction that wasn't load/store/fence"
 
@@ -641,8 +649,9 @@ inductive increment_reachable {c : SystemConfig} : IncState c → Prop where
                 cc := default,
                 shimVec := default,
                 net := default,
+                msgIds := default
                 execution := e,
-                done := false
+                done := default
             }
   | step :
       forall (s s' : IncState c),
