@@ -173,7 +173,7 @@ instance (c : SystemConfig) [Repr (Shim c)] : Repr (ShimType c) where
 
 -- A single trace is a sequence of operations.
 def Trace (α : Type u) (steps : Nat) := Fin steps → α
-
+-- todo change execution to vector of Traces
 -- Multi-threaded traces are a sequence of traces.
 def TraceSet (α : Type u) (threads : Nat) (steps : Nat) := Fin threads → Trace α steps
 -- #check TraceSet Instr 3 2
@@ -595,7 +595,7 @@ def getAndIssueInstr {c : SystemConfig} (shim : ShimId c) (state : IncState c) :
         let (shimVec', net', msgIds') := shimFence shim state'.shimVec state'.net state'.msgIds
         let state'' := {state' with shimVec := shimVec', net := net', msgIds := msgIds'}
         state''
-    | _ => panic! "IssueInstr got instruction that wasn't load/store/fence"
+    | PermissionType.none => panic! "IssueInstr got instruction that wasn't load/store/fence"
 
 def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : Prop :=
     let shimStruct := state.shimVec[shimId]
@@ -605,8 +605,25 @@ def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : 
         shimStruct.pendingWSC = false ∧
         (state.execution shimId shimStruct.qInd).pend = false
     )
+    ∧ -- TODO check this
+    ((getInstr shimId state.shimVec state.execution).2.access ≠ PermissionType.none)
 
-
+-- @[simp]
+-- theorem List.get_tail_succ {α : Type u} [Inhabited α] (v : List α) :
+--     v.length > 0 →
+--     (forall (i : Fin (v.tail.length)), v.tail[i] = v[i.succ]!) := by
+--     intro h i
+--     simp only [List.tail]
+--     split
+--     case h_1 =>
+--         exfalso
+--         simp at h
+--     case h_2 x xs =>
+--         simp at *
+--         rfl
+    -- | mk l h =>
+    -- simp [Vector.tail]
+    -- ring_nf
 -----------------------------------------------------------------------
 -- state transition
 
