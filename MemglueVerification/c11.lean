@@ -31,14 +31,21 @@ deriving DecidableEq
 --     { (a, b) | a.access = PermissionType.store ∧ b.access = PermissionType.store }
 
 def executionToSet {c : SystemConfig} (e : Execution c) : Set (Event c) :=
+    -- let evts_from_exe :=
+    --     {a : Event c | ∃ (t : ShimId c) (s : QInd c),
+    --     (e t s).access = a.access ∧
+    --     (e t s).addr = a.addr ∧
+    --     (e t s).data = a.data ∧
+    --     (same_stren (e t s).stren a.mode) ∧
+    --     a.eid = (t.val, s.val) ∧
+    --     (e t s).access ≠ PermissionType.none}
     let evts_from_exe :=
-        {a : Event c | ∃ (t : ShimId c) (s : QInd c),
-        (e t s).access = a.access ∧
-        (e t s).addr = a.addr ∧
-        (e t s).data = a.data ∧
-        (same_stren (e t s).stren a.mode) ∧
-        a.eid = (t.val, s.val) ∧
-        (e t s).access ≠ PermissionType.none}
+        {a : Event c | ∃ (t : ShimId c) (s : QInd),
+        e[t].list[s]!.access = a.access ∧
+        e[t].list[s]!.addr = a.addr ∧
+        e[t].list[s]!.data = a.data ∧
+        (same_stren e[t].list[s]!.stren a.mode) ∧
+        a.eid = (t.val, s)}
     let initialization_evts : Set (Event c) := (Finset.image
         (fun i =>
             ({ access := store, mode := SC, addr := Fin.ofNat c.addrCount i, data := 0, eid := (c.threads + i, 0) } : Event c))
@@ -128,7 +135,6 @@ def valid_mode {c : SystemConfig} (e : Event c) : Prop :=
     | load => read_mode e.mode
     | store => write_mode e.mode
     | fence => fence_mode e.mode
-    | PermissionType.none => panic! "a;skdfj"
 
 def valid_evts {c : SystemConfig} (evts : Set (Event c)) : Prop :=
     (∀ e1 e2, e1 ∈ evts ∧ e2 ∈ evts →
