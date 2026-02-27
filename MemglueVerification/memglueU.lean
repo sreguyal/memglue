@@ -318,6 +318,16 @@ structure Coherence {c : SystemConfig} (e e': Execution c) : Prop where
 -- theorem protocol_respects_coherence :
 --     ∀ {c : SystemConfig} (e e': Execution c), protocol e = e' → Coherence e e' := by sorry
 
+def maxSeenId {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) : Nat :=
+    let seenList := shimVec[shim].cacheSet
+    let maxVal := seenList.foldl max 0
+    maxVal
+
+def maxSeenIdBoth {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) : Nat :=
+    let initialMax := maxSeenId shim shimVec
+    let bufList := shimVec[shim].bufferSet
+    let finalMax := bufList.foldl max initialMax
+    finalMax
 
 ----------------------------------------------------------------------
 -- Procedures
@@ -558,23 +568,40 @@ def shimReceiveAndPopMsg {c : SystemConfig} (shim : ShimId c) (state : IncState 
 -- SHIM: outgoing messages
 -- Write value, or send WRITE to CC
 def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength)
-              (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) (msgIds : MessageIds c):
-              (ShimType c) × (Execution c) × (NETOrdered c) × (MessageIds c) :=
-            let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
-            let (shimVec', e') := popInstr shim shimVec e
-            let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
+              (shimVec : ShimType c) (e : Execution c) (net : NETUnordered c) (msgIds : MessageIds c):
+              (ShimType c) × (Execution c) × (NETUnordered c) × (MessageIds c) :=
 
-            let shimNode : Node c := Fin.castSucc shim
-            let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
-            -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
-
-            let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren net msgIds
-            if stren = OpStrength.SC then
-                let modShim := {shimVec''[shim] with pendingWSC := true}
-                let shimVec''' := shimVec''.set shim modShim
-                (shimVec''', e', net', msgIds')
+            -- check sync bit
+            let shimElem' := shimVec[shim].state[addr]
+            if ((shimElem'.state = CacheState.Invalid) ∧ (shimElem'.syncBit = false)) then
+                    panic! "Sync Bit improperly set"
             else
-                (shimVec'', e', net', msgIds')
+                let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
+                let (shimVec', e') := popInstr shim shimVec e --popInstr?
+                let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
+
+                let shim' := shimVec''[shim]
+                let shimCache' := shim'.state
+                let shimElem'' := shimCache'[addr]
+                let shimElem''' := { shimElem'' with lwc := shimElem''.lwc + 1 }
+                let shimCache'' := shimCache'.set addr shimElem'''
+                let shim'' := { shim' with
+                    state := shimCache'',
+                    ocnt := shim'.ocnt + 1
+                }
+                let shimVec''' := shimVec''.set shim shim''
+
+                let shimNode : Node c := Fin.castSucc shim
+                let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+                -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
+
+                let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren shim''.ocnt 0 0 (maxSeenIdBoth shim shimVec''') 0 net msgIds
+                if stren = OpStrength.SC then
+                    let modShim := {shimVec'''[shim] with pendingWSC := true}
+                    let shimVec'''' := shimVec''.set shim modShim
+                    (shimVec'''', e', net', msgIds')
+                else
+                    (shimVec''', e', net', msgIds')
 -- mp
 -- Read value, or send RREQ to CC
 -- def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
