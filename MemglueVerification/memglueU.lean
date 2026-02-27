@@ -150,39 +150,66 @@ instance (c : SystemConfig) : Inhabited (CCCache c) where default := Vector.repl
 instance (c : SystemConfig) [Repr (CCElemState c)] : Repr (CCCache c) where
     reprPrec cache _ := repr (cache.toList)
 
-structure CCCounterEntry : Type where
+structure CCCounterElem : Type where
     localWriteCount : Nat
     fenceCount : Nat
-    icnt : Nat
-    ocnt : Nat
 deriving Inhabited, Repr
-instance : Inhabited CCCounterEntry where
+instance : Inhabited CCCounterElem where
     default := {
         localWriteCount := 0
         fenceCount := 0
-        icnt := 0
-        ocnt := 0
     }
-abbrev CCCounters (c : SystemConfig) : Type := Vector (Vector CCCounterEntry c.addrCount) c.threads
-instance (c : SystemConfig) : Inhabited (CCCounters c) where default := Vector.replicate c.threads ( Vector.replicate c.addrCount (default : CCCounterEntry ))
-instance (c : SystemConfig) [Repr CCCounterEntry] : Repr (CCCounters c) where
+
+abbrev CCCounterElemPerAddr (c : SystemConfig): Type := Vector CCCounterElem c.addrCount
+instance (c : SystemConfig) : Inhabited (CCCounterElemPerAddr c) where default := Vector.replicate c.addrCount (default : CCCounterElem )
+instance (c : SystemConfig) [Repr CCCounterElem] : Repr (CCCounterElemPerAddr c) where
     reprPrec cache _ := repr (cache.toList)
 
-structure CCSeenIdsEntry : Type where
-    writeId : Nat
-    seenId : Nat
-    seenPerShim : Nat --TODO: fix this
+structure CCCounterPerShim (c : SystemConfig) : Type where
+    ccCounterElemPerAddr : CCCounterElemPerAddr c
+    ocnt : MsgCnt
+    icnt : MsgCnt
 deriving Inhabited, Repr
-instance  : Inhabited CCSeenIdsEntry where
+instance (c : SystemConfig): Inhabited (CCCounterPerShim c) where
+    default := {
+        ccCounterElemPerAddr := default
+        ocnt := 0
+        icnt := 0
+    }
+
+abbrev CCCounters (c : SystemConfig) : Type := Vector (CCCounterPerShim c ) c.threads
+instance (c : SystemConfig) : Inhabited (CCCounters c) where default := Vector.replicate c.threads (default : CCCounterPerShim c )
+instance (c : SystemConfig) [Repr (CCCounterPerShim c) ] : Repr (CCCounters c) where
+    reprPrec cache _ := repr (cache.toList)
+
+structure CCSeenIdsElem : Type where
+    writeId : WriteId
+    seenId : WriteId
+deriving Inhabited, Repr
+instance  : Inhabited CCSeenIdsElem where
     default := {
         writeId := 0
         seenId := 0
-        seenPerShim := 0 --TODO: fix this
     }
 
-abbrev CCSeenIds (c : SystemConfig) : Type := Vector (Vector CCSeenIdsEntry c.addrCount) c.threads
-instance (c : SystemConfig) : Inhabited (CCSeenIds c) where default := Vector.replicate c.threads ( Vector.replicate c.addrCount (default : CCSeenIdsEntry ))
-instance (c : SystemConfig) [Repr CCSeenIdsEntry] : Repr (CCSeenIds c) where
+abbrev CCSeenIdsPerAddr (c : SystemConfig) : Type := Vector CCSeenIdsElem c.addrCount
+instance (c : SystemConfig) : Inhabited (CCSeenIdsPerAddr c) where default := Vector.replicate c.addrCount (default : CCSeenIdsElem )
+instance (c : SystemConfig) [Repr CCSeenIdsElem] : Repr (CCSeenIdsPerAddr c) where
+    reprPrec cache _ := repr (cache.toList)
+
+structure CCSeenIdsPerShim (c : SystemConfig) : Type where
+    ccSeenIdsElem : CCSeenIdsElem
+    seenPerShim : WriteId
+deriving Inhabited, Repr
+instance (c : SystemConfig) : Inhabited (CCSeenIdsPerShim c) where
+    default := {
+        ccSeenIdsElem := default
+        seenPerShim := 0
+    }
+
+abbrev CCSeenIds (c : SystemConfig) : Type := Vector (CCSeenIdsPerShim c) c.threads
+instance (c : SystemConfig) : Inhabited (CCSeenIds c) where default := Vector.replicate c.threads (default : CCSeenIdsPerShim c)
+instance (c : SystemConfig) [Repr (CCSeenIdsPerShim c)] : Repr (CCSeenIds c) where
     reprPrec cache _ := repr (cache.toList)
 
 -- Litmus test specific---------
@@ -631,12 +658,12 @@ def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net :
         (shimVec', net', msgIds')
 
   -- CC: process messages -----------------------------------------------------
-def foldSharers {c : SystemConfig} (sharers : List (Node c)) (msg : Message c) (net : NETOrdered c) (msgIds : MessageIds c) (CC : CCMachine c)
-: NETOrdered c × MessageIds c :=
+def foldSharers {c : SystemConfig} (sharers : List (Node c)) (msg : Message c) (net : NETUnordered c) (msgIds : MessageIds c) (CC : CCMachine c)
+: NETUnordered c × MessageIds c :=
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
 
     List.foldl
-        (fun (net_msgIds : NETOrdered c × MessageIds c) (shim : Node c) =>
+        (fun (net_msgIds : NETUnordered c × MessageIds c) (shim : Node c) =>
         send MType.WRITE CCNode shim msg.data msg.addr CC.cache[msg.addr].ts msg.stren
             net_msgIds.1 net_msgIds.2
         )
@@ -697,10 +724,10 @@ def CCSendMsgToSharers {c : SystemConfig} (msg : Message c) (net : NETOrdered c)
 --                     CCSendMsgToSharers next msg net msgIds CC
 --         else panic! "potentialSharer passed into CCsendToSharers is not a valid shimId (≥ c.threads)"
 
-#eval (default : NETOrdered default)
+#eval (default : NETUnordered default)
 def cceveryonesharers := {(default : CCMachine default) with cache := (default : CCCache default).set 0 {(default : CCElemState default ) with sharers := Vector.mk #[true, true] (by decide)}}
 #eval cceveryonesharers
-#eval CCSendMsgToSharers {(default : Message default) with src := 2} (default : NETOrdered default) default cceveryonesharers
+#eval CCSendMsgToSharers {(default : Message default) with src := 2} (default : NETUnordered default) default cceveryonesharers
 #eval (cceveryonesharers.cache[0]).sharers[0] = true ∧ 0 ≠ (default : Message default).src
 
 def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
@@ -713,17 +740,25 @@ def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c
     else
         panic! "source of message to the CC was the CC??"
 
-def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETOrdered c) (msgIds : MessageIds c)
-: (CCMachine c) × (NETOrdered c) × (MessageIds c) :=
+def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETUnordered c) (msgIds : MessageIds c)
+: (CCMachine c) × (NETUnordered c) × (MessageIds c) :=
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
     match msg.mtype with
     | MType.WRITE =>
         if h : msg.src < c.threads.val then
-            -- write data, increment ts
-            let CCElemData' : CCElemState c := {(CC.cache[msg.addr]) with data := msg.data, ts := (CC.cache[msg.addr]).ts + 1}
+            -- write data
+                let ts' := msg.ts
+            let ts' :=
+                if CC.cache[msg.addr].ts >= msg.ts then
+                    CC.cache[msg.addr].ts + 1 -- if data is stale, incr. ts
+                else
+                    msg.ts
+            let CCElemData' : CCElemState c := {(CC.cache[msg.addr]) with data := msg.data, ts := ts'}
             let CCCache' : CCCache c := CC.cache.set msg.addr CCElemData'
+
             let CC' : CCMachine c := {CC with cache := CCCache'}
 
+                  CC.seenIds[msg.src].seenIds[msg.addr].wCntr := CC.seenIds[msg.src].seenIds[msg.addr].wCntr + 1;
             -- send write to sharers
             let (net', msgIds') := CCSendMsgToSharers msg net msgIds CC'
 
