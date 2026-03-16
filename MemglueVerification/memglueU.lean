@@ -198,12 +198,12 @@ instance (c : SystemConfig) [Repr CCSeenIdsElem] : Repr (CCSeenIdsPerAddr c) whe
     reprPrec cache _ := repr (cache.toList)
 
 structure CCSeenIdsPerShim (c : SystemConfig) : Type where
-    ccSeenIdsElem : CCSeenIdsElem
+    ccSeenIdsPerAddr : CCSeenIdsPerAddr c
     seenPerShim : WriteId
 deriving Inhabited, Repr
 instance (c : SystemConfig) : Inhabited (CCSeenIdsPerShim c) where
     default := {
-        ccSeenIdsElem := default
+        ccSeenIdsPerAddr := default
         seenPerShim := 0
     }
 
@@ -254,8 +254,8 @@ structure Shim (c : SystemConfig) : Type where
     fencePending : Bool
     icnt : Nat
     ocnt : Nat
-    cacheSet : SeenSet
-    bufferSet : SeenSet
+    seenCache : SeenSet
+    seenBuf : SeenSet
     msgBuf : MsgBuffer c
     qInd : QInd
     -- qCnt : QCnt c
@@ -268,8 +268,8 @@ instance (c : SystemConfig) : Inhabited (Shim c) where
         fencePending := false
         icnt := 0
         ocnt := 0
-        cacheSet := { } -- default list?
-        bufferSet := { }
+        seenCache := { } -- default list?
+        seenBuf := { }
         msgBuf := default
         qInd := 0
         -- qCnt := ⟨c.steps, Nat.lt_succ_self c.steps⟩
@@ -344,18 +344,66 @@ structure Coherence {c : SystemConfig} (e e': Execution c) : Prop where
 
 -- theorem protocol_respects_coherence :
 --     ∀ {c : SystemConfig} (e e': Execution c), protocol e = e' → Coherence e e' := by sorry
+-- Return whether writeId v is in the seenSet of shim s
+def inSeenSet {c : SystemConfig} (s : Shim c) (v : WriteId) : Bool :=
+  match s.seenCache with
+  | [] => false
+  | (head :: tail) => v <= head || tail.contains v
 
-def maxSeenId {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) : Nat :=
-    let seenList := shimVec[shim].cacheSet
-    let maxVal := seenList.foldl max 0
-    maxVal
+-- Return whether writeId v is in the seenSetBuf of shim s
+def inSeenSetShimBuf {c : SystemConfig} (s : Shim c) (v : WriteId) : Bool :=
+  s.seenBuf.contains v
 
-def maxSeenIdBoth {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) : Nat :=
-    let initialMax := maxSeenId shim shimVec
-    let bufList := shimVec[shim].bufferSet
-    let finalMax := bufList.foldl max initialMax
-    finalMax
+/-- Adds v to the seenSet of shim s -/
+def addSeenId {c : SystemConfig} (s : Shim c) (v : WriteId) : Option (Shim c) :=
+  if inSeenSet s v then
+    some s
+--   else if s.seenCache.length >= s.maxSize then
+--     none -- Equivalent to "Seen set is full" assertion
+  else
+    some { s with seenCache := s.seenCache ++ [v] }
 
+/-- Adds v to the shim buffer seenSetBuf of shim s -/
+def addSeenIdShimBuf {c : SystemConfig} (s : Shim c) (v : WriteId) : Option (Shim c) :=
+  if inSeenSetShimBuf s v then
+    some s
+--   else if s.seenBuf.length >= s.maxSize then #TODO: max size?
+--     none
+  else
+    some { s with seenBuf := s.seenBuf ++ [v] }
+
+/-- Helper function to replicate Murphi's manual shift-removal -/
+def eraseFirst {α : Type} [BEq α] (l : List α) (v : α) : List α :=
+  match l with
+  | [] => []
+  | x :: xs => if x == v then xs else x :: eraseFirst xs v
+
+/-- Removes v from the shim buffer seenSet of shim s -/
+def removeSeenIdShimBuf {c : SystemConfig} (s : Shim c) (v : WriteId) : Shim c :=
+  if s.seenBuf.contains v then
+    { s with seenBuf := eraseFirst s.seenBuf v }
+  else
+    s
+
+def maxSeenId {c : SystemConfig} (s : Shim c) : WriteId :=
+  s.seenCache.foldl max 0
+
+def maxSeenIdBoth {c : SystemConfig} (s : Shim c) : WriteId :=
+    let m1 := s.seenCache.foldl max 0
+    let m2 := s.seenBuf.foldl max 0
+    max m1 m2
+
+def cullSeenSet {c : SystemConfig} (s : Shim c) : Shim c :=
+  -- 1. Identify the maximum value across both lists
+  let maxVal := maxSeenIdBoth s
+
+  -- 2. Construct the new state:
+  --    - seenSet becomes a singleton list containing only the watermark.
+  --    - seenBuf is cleared (emptied).
+  { s with
+      seenCache := [maxVal],
+      seenBuf := []
+  }
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
@@ -604,12 +652,14 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
                     panic! "Sync Bit improperly set"
             else
                 let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
-                let (shimVec', e') := popInstr shim shimVec e --popInstr?
+                let (shimVec', e') := popInstr shim shimVec e --TODO: is popInstr good?
+                -- write new val to cache in shim, return new shim vector
                 let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
-
+                -- the new shim is read from the shim vector, the new cache state, element at address is read from shim
                 let shim' := shimVec''[shim]
                 let shimCache' := shim'.state
                 let shimElem'' := shimCache'[addr]
+                -- increment the lwc in the shim element, update the shim cache, shim, and shimvec appropriately
                 let shimElem''' := { shimElem'' with lwc := shimElem''.lwc + 1 }
                 let shimCache'' := shimCache'.set addr shimElem'''
                 let shim'' := { shim' with
@@ -622,9 +672,10 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
                 let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
                 -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
 
-                let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren shim''.ocnt 0 0 (maxSeenIdBoth shim shimVec''') 0 net msgIds
+                let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren shim''.ocnt 0 0 (maxSeenIdBoth shim'') 0 net msgIds
+                --
                 if stren = OpStrength.SC then
-                    let modShim := {shimVec'''[shim] with pendingWSC := true}
+                    let modShim := {shimVec'''[shim] with pendingWSC := true} --we set pendingWSC
                     let shimVec'''' := shimVec''.set shim modShim
                     (shimVec'''', e', net', msgIds')
                 else
@@ -745,37 +796,122 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
     match msg.mtype with
     | MType.WRITE =>
-        if h : msg.src < c.threads.val then
-            -- write data
-                let ts' := msg.ts
+        if h : msg.src < c.threads then
+            let msgSrcShim : ShimId c := ⟨msg.src, h⟩
+            -- 1. increment ts
             let ts' :=
                 if CC.cache[msg.addr].ts >= msg.ts then
-                    CC.cache[msg.addr].ts + 1 -- if data is stale, incr. ts
+                    CC.cache[msg.addr].ts + 1
                 else
                     msg.ts
-            let CCElemData' : CCElemState c := {(CC.cache[msg.addr]) with data := msg.data, ts := ts'}
+
+            -- 2. always perform write -- Update Cache Data, TS, and lastWriteShim
+            let CCElemData' : CCElemState c := { (CC.cache[msg.addr]) with
+                data := msg.data,
+                ts := ts',
+                lastWriteShim := msg.src
+            }
             let CCCache' : CCCache c := CC.cache.set msg.addr CCElemData'
+            let CC' : CCMachine c := { CC with cache := CCCache' }
 
-            let CC' : CCMachine c := {CC with cache := CCCache'}
+            -- 3. Update wCntr (mapped to localWriteCount in counters)
+            let shimCntrs := CC'.counters.get msgSrcShim
+            let addrCntr := shimCntrs.ccCounterElemPerAddr.get msg.addr
+            let shimCntrs' := { shimCntrs with
+                ccCounterElemPerAddr := shimCntrs.ccCounterElemPerAddr.set msg.addr
+                    { addrCntr with localWriteCount := addrCntr.localWriteCount + 1 }
+            }
+            let CC'' := { CC' with counters := CC'.counters.set msgSrcShim shimCntrs' }
 
-                  CC.seenIds[msg.src].seenIds[msg.addr].wCntr := CC.seenIds[msg.src].seenIds[msg.addr].wCntr + 1;
-            -- send write to sharers
-            let (net', msgIds') := CCSendMsgToSharers msg net msgIds CC'
+            -- 4. Update seenIds and seenPerShim logic
+            let shimSeen := CC''.seenIds.get msgSrcShim
+            let addrSeen := shimSeen.ccSeenIdsPerAddr.get msg.addr
 
-            -- If SC or first write, send write acknowledgement
-            let msgSrcShim : ShimId c := ⟨msg.src, h⟩
-            let (net'', msgIds'') :=
-                if msg.stren = OpStrength.SC ∨ (CC'.cache[msg.addr]).sharers[msgSrcShim] = false then
-                    send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net' msgIds'
-                else (net', msgIds')
+            let newSeenId :=
+                if msg.stren != OpStrength.RLX then
+                    if shimSeen.seenPerShim > msg.seenId then shimSeen.seenPerShim else msg.seenId
+                else
+                    addrSeen.seenId
 
-            -- add src to sharers
-            -- let sharerVec' := (CC'.cache.get msg.addr).sharers.set msgSrcShim true
-            -- let CCElemData'' := {(CC'.cache.get msg.addr) with sharers := sharerVec'}
-            -- let CCCache'' := CC'.cache.set msg.addr CCElemData''
-            -- let CC'' := {CC' with cache := CCCache''}
-            let CC'' := CCAddSrcShimToSharers CC' msg
-            (CC'', net'', msgIds'')
+            let updatedAddrSeen := { addrSeen with
+                seenId := newSeenId,
+                writeId := wIdCounter
+            }
+            let shimSeen' := { shimSeen with
+                ccSeenIdsPerAddr := shimSeen.ccSeenIdsPerAddr.set msg.addr updatedAddrSeen,
+                seenPerShim := wIdCounter
+            }
+            let CC''' := { CC'' with seenIds := CC''.seenIds.set msgSrcShim shimSeen' }
+
+            -- Increment wIdCounter for next use
+            let wIdCounter' := wIdCounter + 1
+
+            -- 5. Send WRITE to sharers (except source)
+            -- We fold over shims to handle the 'for' loop and ocnt increments
+            let (net', msgIds', CC'''') :=
+                List.foldl (init := (net, msgIds, CC''')) (List.finRange c.threads) (fun (n, ids, currCC) sharer =>
+                    let elem := currCC.cache.get msg.addr
+                    if elem.sharers.get sharer && sharer != msgSrcShim then
+                        -- Fetch indices for Send arguments
+                        let lastWriteShim := elem.lastWriteShim
+                        let srcSeen := (currCC.seenIds.get lastWriteShim).ccSeenIdsPerAddr.get msg.addr
+                        let destCntrs := currCC.counters.get sharer
+                        let destSeenAddr := (currCC.seenIds.get sharer).ccSeenIdsPerAddr.get msg.addr
+
+                        let (n', ids') := send MType.WRITE 0 sharer msg.data msg.addr ts' msg.stren
+                            destCntrs.ocnt destCntrs.ccCounterElemPerAddr.get(msg.addr).fenceCount -- Assuming fenceCount maps here
+                            srcSeen.writeId srcSeen.seenId msg.qInd destSeenAddr.seenId n ids -- Using wCntr/seenId context
+
+                        -- Increment ocnt for sharer
+                        let currCC' := { currCC with
+                            counters := currCC.counters.set sharer { destCntrs with ocnt := destCntrs.ocnt + 1 }
+                        }
+                        (n', ids', currCC')
+                    else (n, ids, currCC)
+                )
+
+            -- 6. Send WRITE_ACK if SC or first write (msg.src not in sharers)
+            let (net'', msgIds'', CC''''') :=
+                if msg.stren = OpStrength.SC || (CC''''.cache.get msg.addr).sharers.get msgSrcShim = false then
+                    let lastWriteShim := (CC''''.cache.get msg.addr).lastWriteShim
+                    let srcSeen := (CC''''.seenIds.get lastWriteShim).ccSeenIdsPerAddr.get msg.addr
+                    let destCntrs := CC''''.counters.get msgSrcShim
+
+                    let (n_ack, ids_ack) := send MType.WRITE_ACK 0 msg.src msg.data msg.addr ts' msg.stren
+                        destCntrs.ocnt 0 -- Murphi implies fenceCnt usage here
+                        srcSeen.writeId srcSeen.seenId msg.qInd 0 n' msgIds'
+
+                    let CC_final_ack := { CC'''' with
+                        counters := CC''''.counters.set msgSrcShim { destCntrs with ocnt := destCntrs.ocnt + 1 }
+                    }
+                    (n_ack, ids_ack, CC_final_ack)
+                else (net', msgIds', CC'''')
+
+            -- 7. Final step: add src to sharers
+            let finalElem := CC'''''.cache.get msg.addr
+            let finalCache := CC'''''.cache.set msg.addr { finalElem with sharers := finalElem.sharers.set msgSrcShim true }
+            let CC_final := { CC''''' with cache := finalCache }
+
+            (CC_final, net'', msgIds'', wIdCounter')
+
+            -- let CC.seenIds[msg.src].seenIds[msg.addr].wCntr := CC.seenIds[msg.src].seenIds[msg.addr].wCntr + 1;
+            -- -- send write to sharers
+            -- let (net', msgIds') := CCSendMsgToSharers msg net msgIds CC'
+
+            -- -- If SC or first write, send write acknowledgement
+            -- let msgSrcShim : ShimId c := ⟨msg.src, h⟩
+            -- let (net'', msgIds'') :=
+            --     if msg.stren = OpStrength.SC ∨ (CC'.cache[msg.addr]).sharers[msgSrcShim] = false then
+            --         send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net' msgIds'
+            --     else (net', msgIds')
+
+            -- -- add src to sharers
+            -- -- let sharerVec' := (CC'.cache.get msg.addr).sharers.set msgSrcShim true
+            -- -- let CCElemData'' := {(CC'.cache.get msg.addr) with sharers := sharerVec'}
+            -- -- let CCCache'' := CC'.cache.set msg.addr CCElemData''
+            -- -- let CC'' := {CC' with cache := CCCache''}
+            -- let CC'' := CCAddSrcShimToSharers CC' msg
+            -- (CC'', net'', msgIds'')
         else
             panic! "source of message to the CC was the CC??"
     | MType.RREQ =>
