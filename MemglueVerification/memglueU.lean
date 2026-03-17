@@ -132,12 +132,14 @@ structure CCElemState (c : SystemConfig) : Type where
     data : Data
     ts : Timestamp
     sharers : Vector Bool c.threads
+    lastWriteShim : Node c
 deriving Inhabited, Repr
 instance (c : SystemConfig) : Inhabited (CCElemState c) where
     default := {
         data := default
         ts := default
         sharers := Vector.replicate c.threads false -- make this true for store buffer test
+        lastWriteShim := 0
         }
 
 abbrev ShimCache (c : SystemConfig) : Type := Vector ShimElemState c.addrCount
@@ -282,9 +284,16 @@ structure CCMachine (c : SystemConfig) : Type where
     counters : CCCounters c
     seenIds : CCSeenIds c
     buf : MsgBuffer c
+    wIdCounter : WriteId
 deriving Inhabited, Repr
-
-
+instance (c : SystemConfig) : Inhabited (CCMachine c) where
+    default := {
+        cache := default,
+        counters := default,
+        seenIds := default,
+        buf := default,
+        wIdCounter := 1      -- Initialized to 1 per Murphi model
+    }
 
 abbrev ShimType (c : SystemConfig) : Type := Vector (Shim c) c.threads
 instance (c : SystemConfig) : Inhabited (ShimType c) where default := Vector.replicate c.threads (default : Shim c)
@@ -709,94 +718,102 @@ def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net :
         (shimVec', net', msgIds')
 
   -- CC: process messages -----------------------------------------------------
-def foldSharers {c : SystemConfig} (sharers : List (Node c)) (msg : Message c) (net : NETUnordered c) (msgIds : MessageIds c) (CC : CCMachine c)
-: NETUnordered c × MessageIds c :=
+-- Helper to fold over the filtered list of sharers and send WRITE messages
+def foldSharersWrites {c : SystemConfig}
+    (sharers : List (ShimId c))
+    (msg : Message c)
+    (ts' : Timestamp)
+    (acc : NETUnordered c × MessageIds c × CCMachine c)
+    : NETUnordered c × MessageIds c × CCMachine c :=
+
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
 
-    List.foldl
-        (fun (net_msgIds : NETUnordered c × MessageIds c) (shim : Node c) =>
-        send MType.WRITE CCNode shim msg.data msg.addr CC.cache[msg.addr].ts msg.stren
-            net_msgIds.1 net_msgIds.2
-        )
-        (net, msgIds)
-        sharers
+    List.foldl (fun (currAcc : NETUnordered c × MessageIds c × CCMachine c) (sharer : ShimId c) =>
+        let (n, ids, currCC) := currAcc
+        let elem := currCC.cache[msg.addr]
 
-def CCSendMsgToSharers {c : SystemConfig} (msg : Message c) (net : NETOrdered c) (msgIds : MessageIds c) (CC : CCMachine c)
-: NETOrdered c × MessageIds c :=
+        -- Extract the last write shim and handle the type cast (ShimId vs Node)
+        let lastWriteShim := elem.lastWriteShim
+        let lastWriteShimId : ShimId c := ⟨lastWriteShim.val, sorry⟩ -- Replace sorry with actual proof
 
-    let allNodes : List (Node c) := (List.finRange (c.threads + 1))
-    let sharers : List (Node c) := allNodes.filter (fun shim =>
-        (shim : Nat) ≠ (msg.src : Nat) ∧ CC.cache[msg.addr].sharers[shim]! = true ∧
-        (shim : Nat) ≠ (c.threads : Nat)
+        let srcSeen := (currCC.seenIds[lastWriteShimId]).ccSeenIdsPerAddr[msg.addr]
+        let destCntrs := currCC.counters[sharer]
+        let destSeenAddr := (currCC.seenIds[sharer]).ccSeenIdsPerAddr[msg.addr]
+
+        -- Send the message
+        let (n', ids') := send MType.WRITE CCNode sharer.castSucc msg.data msg.addr ts' msg.stren
+            destCntrs.ocnt destCntrs.ccCounterElemPerAddr[msg.addr].fenceCount
+            srcSeen.writeId srcSeen.seenId destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount n ids
+
+        -- Increment ocnt for the sharer in the CC state
+        let currCC' := { currCC with
+            counters := currCC.counters.set sharer { destCntrs with ocnt := destCntrs.ocnt + 1 }
+        }
+
+        (n', ids', currCC')
+    ) acc sharers
+
+
+-- Helper to filter the shims and initiate the fold
+def CCSendWriteToSharers {c : SystemConfig}
+    (msg : Message c)
+    (ts' : Timestamp)
+    (msgSrcShim : ShimId c)
+    (net : NETUnordered c)
+    (msgIds : MessageIds c)
+    (CC : CCMachine c)
+    : NETUnordered c × MessageIds c × CCMachine c :=
+
+    let allShims : List (ShimId c) := List.finRange c.threads
+
+    -- Filter for shims that are sharing the address AND are not the source of the write
+    let sharers : List (ShimId c) := allShims.filter (fun shim =>
+        CC.cache[msg.addr].sharers[shim]! = true ∧ shim != msgSrcShim
     )
 
-    foldSharers sharers msg net msgIds CC
+    foldSharersWrites sharers msg ts' (net, msgIds, CC)
 
+-- Helper to send a WRITE_ACK if the operation is SC or the source is not yet a sharer
+def CCSendWriteAck {c : SystemConfig}
+    (msg : Message c)
+    (ts' : Timestamp)
+    (msgSrcShim : ShimId c)
+    (net : NETUnordered c)
+    (msgIds : MessageIds c)
+    (CC : CCMachine c)
+    : NETUnordered c × MessageIds c × CCMachine c :=
 
+    if msg.stren = OpStrength.SC ∨ CC.cache[msg.addr].sharers[msgSrcShim]! = false then
+        let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+        let lastWriteShim := CC.cache[msg.addr].lastWriteShim
 
+        -- Type cast for indexing seenIds (assuming lastWriteShim < c.threads here)
+        let lastWriteShimId : ShimId c := ⟨lastWriteShim.val, sorry⟩
 
+        let srcSeen := (CC.seenIds[lastWriteShimId]).ccSeenIdsPerAddr[msg.addr]
+        let destCntrs := CC.counters[msgSrcShim]
 
-    -- Fin.foldl c.threads
-    --     (
-    --         fun (net_msgIds : NETOrdered c × MessageIds c) (shim : ShimId c) =>
-    --             if (shim : Nat) ≠ (msg.src : Nat) ∧ (CC.cache[msg.addr].sharers[shim] = true) then
-    --                 send MType.WRITE CCNode shim.castSucc msg.data msg.addr CC.cache[msg.addr].ts msg.stren net_msgIds.1 net_msgIds.2
-    --             else
-    --                 net_msgIds
-    --     )
-    --     (net, msgIds)
+        -- Send the WRITE_ACK message
+        let (net_ack, ids_ack) := send MType.WRITE_ACK CCNode msgSrcShim.castSucc msg.data msg.addr ts' msg.stren
+            destCntrs.ocnt 0 -- 0 represents the empty fence count context here
+            srcSeen.writeId srcSeen.seenId destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount net msgIds
 
--- def CCSendMsgToSharers {c : SystemConfig} (potentialSharer : Nat) (msg : Message c) (net : NETOrdered c) (msgIds : MessageIds c) (CC : CCMachine c)
--- : NETOrdered c × MessageIds c:=
---         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
---         if h : potentialSharer < c.threads then
---             -- let shim : ShimId c := ⟨potentialSharer, h⟩
---             -- let node := shim.castSucc
+        -- Increment ocnt for the source shim in the CC state
+        let CC_ack := { CC with
+            counters := CC.counters.set msgSrcShim { destCntrs with ocnt := destCntrs.ocnt + 1 }
+        }
 
---             -- if node ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[shim] = true then
---             -- match potentialSharer with
---             -- | 0 =>
-
-
---             match potentialSharer with
---             | 0 =>
---                 if 0 ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[0] = true then
---                     send MType.WRITE CCNode 0 msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
---                 else
---                     (net, msgIds)
---             | ps + 1 =>
---                 let curShim : ShimId c := ⟨ps + 1, h⟩
---                 let curNode : Node c := curShim.castSucc
---                 let next := ps
---                 if curNode ≠ msg.src ∧ (CC.cache[msg.addr]).sharers[curShim] = true then
---                     let (net', msgIds') := send MType.WRITE CCNode curNode msg.data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
---                     CCSendMsgToSharers next msg net' msgIds' CC
---                 else
---                     CCSendMsgToSharers next msg net msgIds CC
---         else panic! "potentialSharer passed into CCsendToSharers is not a valid shimId (≥ c.threads)"
-
-#eval (default : NETUnordered default)
-def cceveryonesharers := {(default : CCMachine default) with cache := (default : CCCache default).set 0 {(default : CCElemState default ) with sharers := Vector.mk #[true, true] (by decide)}}
-#eval cceveryonesharers
-#eval CCSendMsgToSharers {(default : Message default) with src := 2} (default : NETUnordered default) default cceveryonesharers
-#eval (cceveryonesharers.cache[0]).sharers[0] = true ∧ 0 ≠ (default : Message default).src
-
-def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
-    if h : msg.src < c.threads.val then
-        let sharerVec' := (CC.cache[msg.addr]).sharers.set msg.src true
-        let CCElemData' := {(CC.cache[msg.addr]) with sharers := sharerVec'}
-        let CCCache' := CC.cache.set msg.addr CCElemData'
-        let CC' := {CC with cache := CCCache'}
-        CC'
+        (net_ack, ids_ack, CC_ack)
     else
-        panic! "source of message to the CC was the CC??"
+        -- If conditions aren't met, return state unmodified
+        (net, msgIds, CC)
 
 def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETUnordered c) (msgIds : MessageIds c)
 : (CCMachine c) × (NETUnordered c) × (MessageIds c) :=
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
     match msg.mtype with
     | MType.WRITE =>
-        if h : msg.src < c.threads then
+        if h : msg.src < c.threads.val then -- msg src is a shim
             let msgSrcShim : ShimId c := ⟨msg.src, h⟩
             -- 1. increment ts
             let ts' :=
@@ -833,85 +850,42 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
                 else
                     addrSeen.seenId
 
+            let currentWId := CC''.wIdCounter
+
             let updatedAddrSeen := { addrSeen with
                 seenId := newSeenId,
-                writeId := wIdCounter
+                writeId := currentWId
             }
             let shimSeen' := { shimSeen with
                 ccSeenIdsPerAddr := shimSeen.ccSeenIdsPerAddr.set msg.addr updatedAddrSeen,
-                seenPerShim := wIdCounter
+                seenPerShim := currentWId
             }
-            let CC''' := { CC'' with seenIds := CC''.seenIds.set msgSrcShim shimSeen' }
 
-            -- Increment wIdCounter for next use
-            let wIdCounter' := wIdCounter + 1
+            -- Pack the updated seenIds AND the incremented wIdCounter into CC'''
+            let CC''' := { CC'' with
+                seenIds := CC''.seenIds.set msgSrcShim shimSeen',
+                wIdCounter := currentWId + 1
+            }
 
             -- 5. Send WRITE to sharers (except source)
             -- We fold over shims to handle the 'for' loop and ocnt increments
-            let (net', msgIds', CC'''') :=
-                List.foldl (init := (net, msgIds, CC''')) (List.finRange c.threads) (fun (n, ids, currCC) sharer =>
-                    let elem := currCC.cache.get msg.addr
-                    if elem.sharers.get sharer && sharer != msgSrcShim then
-                        -- Fetch indices for Send arguments
-                        let lastWriteShim := elem.lastWriteShim
-                        let srcSeen := (currCC.seenIds.get lastWriteShim).ccSeenIdsPerAddr.get msg.addr
-                        let destCntrs := currCC.counters.get sharer
-                        let destSeenAddr := (currCC.seenIds.get sharer).ccSeenIdsPerAddr.get msg.addr
-
-                        let (n', ids') := send MType.WRITE 0 sharer msg.data msg.addr ts' msg.stren
-                            destCntrs.ocnt destCntrs.ccCounterElemPerAddr.get(msg.addr).fenceCount -- Assuming fenceCount maps here
-                            srcSeen.writeId srcSeen.seenId msg.qInd destSeenAddr.seenId n ids -- Using wCntr/seenId context
-
-                        -- Increment ocnt for sharer
-                        let currCC' := { currCC with
-                            counters := currCC.counters.set sharer { destCntrs with ocnt := destCntrs.ocnt + 1 }
-                        }
-                        (n', ids', currCC')
-                    else (n, ids, currCC)
-                )
+            -- 5. Send WRITE to sharers (except source)
+            let (net', msgIds', CC'''') := CCSendWriteToSharers msg ts' msgSrcShim net msgIds CC'''
 
             -- 6. Send WRITE_ACK if SC or first write (msg.src not in sharers)
-            let (net'', msgIds'', CC''''') :=
-                if msg.stren = OpStrength.SC || (CC''''.cache.get msg.addr).sharers.get msgSrcShim = false then
-                    let lastWriteShim := (CC''''.cache.get msg.addr).lastWriteShim
-                    let srcSeen := (CC''''.seenIds.get lastWriteShim).ccSeenIdsPerAddr.get msg.addr
-                    let destCntrs := CC''''.counters.get msgSrcShim
+            -- only fields used in this msg are ts, data, ocnt, other fields not considered
+            let (net'', msgIds'', CC''''') := CCSendWriteAck msg ts' msgSrcShim net' msgIds' CC''''
 
-                    let (n_ack, ids_ack) := send MType.WRITE_ACK 0 msg.src msg.data msg.addr ts' msg.stren
-                        destCntrs.ocnt 0 -- Murphi implies fenceCnt usage here
-                        srcSeen.writeId srcSeen.seenId msg.qInd 0 n' msgIds'
+            -- 7. Add src to sharers
+            let finalElem := CC'''''.cache[msg.addr]
+            let CC_final := { CC''''' with
+                cache := CC'''''.cache.set msg.addr { finalElem with
+                    sharers := finalElem.sharers.set msgSrcShim true
+                }
+            }
 
-                    let CC_final_ack := { CC'''' with
-                        counters := CC''''.counters.set msgSrcShim { destCntrs with ocnt := destCntrs.ocnt + 1 }
-                    }
-                    (n_ack, ids_ack, CC_final_ack)
-                else (net', msgIds', CC'''')
+            (CC_final, net'', msgIds'')
 
-            -- 7. Final step: add src to sharers
-            let finalElem := CC'''''.cache.get msg.addr
-            let finalCache := CC'''''.cache.set msg.addr { finalElem with sharers := finalElem.sharers.set msgSrcShim true }
-            let CC_final := { CC''''' with cache := finalCache }
-
-            (CC_final, net'', msgIds'', wIdCounter')
-
-            -- let CC.seenIds[msg.src].seenIds[msg.addr].wCntr := CC.seenIds[msg.src].seenIds[msg.addr].wCntr + 1;
-            -- -- send write to sharers
-            -- let (net', msgIds') := CCSendMsgToSharers msg net msgIds CC'
-
-            -- -- If SC or first write, send write acknowledgement
-            -- let msgSrcShim : ShimId c := ⟨msg.src, h⟩
-            -- let (net'', msgIds'') :=
-            --     if msg.stren = OpStrength.SC ∨ (CC'.cache[msg.addr]).sharers[msgSrcShim] = false then
-            --         send MType.WRITE_ACK CCNode msg.src msg.data msg.addr (CC'.cache[msg.addr]).ts msg.stren net' msgIds'
-            --     else (net', msgIds')
-
-            -- -- add src to sharers
-            -- -- let sharerVec' := (CC'.cache.get msg.addr).sharers.set msgSrcShim true
-            -- -- let CCElemData'' := {(CC'.cache.get msg.addr) with sharers := sharerVec'}
-            -- -- let CCCache'' := CC'.cache.set msg.addr CCElemData''
-            -- -- let CC'' := {CC' with cache := CCCache''}
-            -- let CC'' := CCAddSrcShimToSharers CC' msg
-            -- (CC'', net'', msgIds'')
         else
             panic! "source of message to the CC was the CC??"
     | MType.RREQ =>
@@ -926,12 +900,32 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
 def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
     let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
     let msg := (state.net[CCNode]).head!
-    let (cc', net', msgIds') := CCReceive msg state.cc state.net state.msgIds
-    let state' := {state with cc := cc', net := net', msgIds := msgIds'}
 
-    let net'' := popMessage CCNode state'.net
-    let state'' := {state' with net := net''}
-    state''
+    -- Verify the message source is a valid shim
+    if h : msg.src.val < c.threads.val then
+        let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
+        let expectedIcnt := state.cc.counters[msgSrcShim].icnt
+
+        if msg.cnt = expectedIcnt then
+            -- IN-ORDER: Process the message
+            let (cc', net', msgIds') := CCReceive msg state.cc state.net state.msgIds
+            -- Increment the CC's icnt for this specific shim
+            let shimCntrs := cc'.counters[msgSrcShim]
+            let cc'' := { cc' with
+                counters := cc'.counters.set msgSrcShim { shimCntrs with icnt := shimCntrs.icnt + 1 }
+            }
+            let net'' := popMessage CCNode net'
+            { state with cc := cc'', net := net'', msgIds := msgIds' }
+
+        else
+            -- OUT-OF-ORDER: Push to the CC buffer and skip processing
+            let ccBuf' := state.cc.buf ++ [msg]
+            let cc' := { state.cc with buf := ccBuf' }
+            let net' := popMessage CCNode state.net
+            { state with cc := cc', net := net' }
+
+    else
+        panic! "CC received a message from an invalid source (not a shim)"
 
 def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
 : (Execution c) × (Instr c) :=
