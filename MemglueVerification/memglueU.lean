@@ -75,8 +75,8 @@ structure Message (c : SystemConfig) : Type where
     writeId : WriteId := 0
     seenId : WriteId := 0
     wCnt : WriteId := 0
+    qInd : MsgCnt := 0
 deriving Repr   --, DecidableEq
-
 instance (c : SystemConfig) : Inhabited (Message c) where
     default := {
         mtype := MType.WRITE
@@ -92,6 +92,7 @@ instance (c : SystemConfig) : Inhabited (Message c) where
         writeId := 0
         seenId := 0
         wCnt := 0
+        qInd := 0
     }
 
 
@@ -459,12 +460,12 @@ def netWithAddedMsg {c : SystemConfig} (msg : Message c) (net : NETUnordered c) 
 
 def send {c : SystemConfig} (mtype' : MType) (src' : Node c) (dst' : Node c)
          (data' : Data) (addr' : Addr c) (ts' : Timestamp) (stren' : OpStrength)
-         (cnt' : MsgCnt) (fenceCnt' : FenceCnt) (writeId' : WriteId) (seenId' : WriteId) (wCnt' : WriteId)
+         (cnt' : MsgCnt) (fenceCnt' : FenceCnt) (writeId' : WriteId) (seenId' : WriteId) (qInd' : MsgCnt) (wCnt' : WriteId)
          (net : NETUnordered c) (msgIds : MessageIds c)
          : NETUnordered c × MessageIds c :=
 
         let msg : (Message c) := {mtype := mtype', src := src', dst := dst', data := data', addr := addr', ts := ts', stren := stren', id := msgIds[dst'],
-                                    cnt := cnt', fenceCnt := fenceCnt', writeId := writeId', seenId := seenId', wCnt := wCnt' }
+                                    cnt := cnt', fenceCnt := fenceCnt', writeId := writeId', seenId := seenId', qInd := qInd', wCnt := wCnt' }
         let msgIds' := msgIds.set dst' (msgIds[dst'] + 1)
         (netWithAddedMsg msg net, msgIds')
 
@@ -494,26 +495,18 @@ def popMessage {c : SystemConfig} (dst : Node c) (net : NETUnordered c) : NETUno
 -- #eval popMessage (1 : Node (default : SystemConfig)) testnet
 
 -- Update output of litmus test load
-def updateVal {c : SystemConfig} (targetThread : ShimId c) (data : Data)
-    (e : Execution c) (shimVec : ShimType c)
-    : Execution c :=
-    let targetStep : QInd := (shimVec[targetThread]).qInd
+def updateVal {c : SystemConfig} (targetThread : ShimId c) (data : Data) (resolveQInd : QInd)
+    (e : Execution c) : Execution c :=
+
     let stepCount := e[targetThread].list.length
-    -- let stepCount := (shimVec[targetThread]).qCnt
-    -- qCnt?
-    if targetStep < stepCount then
-        -- update output
-        let newInstr : Instr c := {e[targetThread].list[targetStep]! with data := data}
-        let newList : List (Instr c) := e[targetThread].list.set targetStep newInstr
+
+    if resolveQInd < stepCount then
+        -- Update the data and explicitly set pend := false
+        let newInstr : Instr c := {e[targetThread].list[resolveQInd]! with data := data, pend := false}
+        let newList : List (Instr c) := e[targetThread].list.set resolveQInd newInstr
         let e' := e.set targetThread {list := newList, nonempty := (by unfold newList; simp; exact e[↑targetThread].nonempty)}
         e'
-        -- fun (t : ShimId c) =>
-        --     fun (s : Fin c.steps) =>
-        --         if t = targetThread ∧ s = targetStep then
-        --             {e t s with data := data}
-        --         else e t s
     else
-        -- keep same
         e
 
 -- def test {c : SystemConfig} (targetThread : ShimId c) (data : Data)
@@ -528,52 +521,21 @@ def updateVal {c : SystemConfig} (targetThread : ShimId c) (data : Data)
 #eval (default : ShimType (default))
 -- example that does update
 
-
--- Remove litmus test instruction
-def popInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
-    : (ShimType c) × (Execution c) :=
-
-    let qInd := (shimVec[shim]).qInd
+def popInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c) : ShimType c :=
+    let qInd := shimVec[shim].qInd
     let qCnt := e[shim].list.length
-    -- let qCnt := (shimVec[shim]).qCnt
-    -- let newExec : Execution c :=       -- still a function but for that thread instruction, pend = false
-    --     fun (t : ShimId c) =>
-    --         fun (s : Fin c.steps) =>
-    --             if t = shim ∧ s = qInd then {e t s with pend := false}
-    --             else e t s
-    let instr' : Instr c := {e[shim].list[qInd]! with pend := false}
-    let list' : List (Instr c) := e[shim].list.set qInd instr'
-    let e' : Execution c := e.set shim {list := list', nonempty := (by unfold list'; simp; exact e[↑shim].nonempty)}
 
     let nextQInd := qInd + 1
-    if h : nextQInd < e'[shim].list.length then
-        let newActiveState := if nextQInd = qCnt then false else (shimVec[shim].active)
-        let shim' := {shimVec[shim] with qInd := nextQInd, active := newActiveState}
-        let shimVec' := shimVec.set shim shim'
 
-        (shimVec', e')
-    else  -- finished last instruction → don't increment qInd out of bounds, just set shim inactive
-        let shim' := {shimVec[shim] with active := false}
-        let shimVec' := shimVec.set shim shim'
+    -- If the next index exceeds or equals the instruction count, the shim is no longer active
+    let isActive := if nextQInd >= qCnt then false else shimVec[shim].active
 
-        (shimVec', e')
-    --todo fix thiss
-    -- if h : qInd + 1 < c.steps then
-    --     -- qInd not about to go out of range → can increment qInd and change active state as in murphi
-    --     let nextQInd : QInd c := ⟨qInd.val + 1, h⟩
-    --     -- CHECK: changed nextQInd = qCnt to nextQInd > qEnd
-    --     let shimInactive : Prop := nextQInd.val = qCnt.val ∨ (e shim nextQInd).access = PermissionType.none
-    --     let newActiveState : Bool := if shimInactive then false else (shimVec[shim]).active
-    --     let newShim : Shim c := {(shimVec[shim]) with qInd := nextQInd, active := newActiveState}
-    --     let newShimVec : ShimType c := shimVec.set shim newShim
+    let shimVec' := shimVec.set shim { shimVec[shim] with
+        qInd := nextQInd,
+        active := isActive
+    }
 
-    --     (newShimVec, newExec)
-    -- else
-    --     -- qInd + 1 is out of range, i.e. after pop, shim should def be inactive
-    --     let newShim : Shim c := {(shimVec[shim]) with active := false}
-    --     let newShimVec : ShimType c := shimVec.set shim newShim
-
-    --     (newShimVec, newExec)
+    shimVec'
 
 #eval popInstr (1:ShimId default) (default : ShimType default) (default : Execution default)
 
@@ -675,9 +637,12 @@ def shimReceive {c : SystemConfig} (shim : ShimId c) (msg : Message c) (inOrder 
                 let finalShimVec := shimVec'.set curShim seenShim
 
                 -- Update test values and pop instruction
-                let e' : Execution c := updateVal curShim data' e finalShimVec
-                let (newShimVec, e'') := popInstr curShim finalShimVec e'
-                (newShimVec, e'')
+                -- REMOVED finalShimVec from updateVal call
+                let e' : Execution c := updateVal curShim data' msg.qInd e
+
+                -- popInstr now returns only ShimType c
+                let newShimVec := popInstr curShim finalShimVec e'
+                (newShimVec, e')
 
             | MType.FREQ =>
                 let modShim := { shimVec[curShim] with fenceCnt := shimVec[curShim].fenceCnt + 1 }
@@ -689,8 +654,8 @@ def shimReceive {c : SystemConfig} (shim : ShimId c) (msg : Message c) (inOrder 
 
                 -- Pop instruction conditionally based on pendingWSC
                 if shimVec[curShim].pendingWSC = false then
-                    let (newShimVec, newExec) := popInstr curShim modShimVec e
-                    (newShimVec, newExec)
+                    let newShimVec := popInstr curShim modShimVec e
+                    (newShimVec, e)
                 else
                     let modShim' := { modShimVec[curShim] with pendingWSC := false }
                     let newShimVec := modShimVec.set curShim modShim'
@@ -773,67 +738,100 @@ def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data)
               (shimVec : ShimType c) (e : Execution c) (net : NETUnordered c) (msgIds : MessageIds c):
               (ShimType c) × (Execution c) × (NETUnordered c) × (MessageIds c) :=
 
-            -- check sync bit
-            let shimElem' := shimVec[shim].state[addr]
-            if ((shimElem'.state = CacheState.Invalid) ∧ (shimElem'.syncBit = false)) then
-                    panic! "Sync Bit improperly set"
-            else
-                let newTs : Timestamp := ((shimVec[shim].state)[addr]).ts + 1
-                let (shimVec', e') := popInstr shim shimVec e --TODO: is popInstr good?
-                -- write new val to cache in shim, return new shim vector
-                let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec'
-                -- the new shim is read from the shim vector, the new cache state, element at address is read from shim
-                let shim' := shimVec''[shim]
-                let shimCache' := shim'.state
-                let shimElem'' := shimCache'[addr]
-                -- increment the lwc in the shim element, update the shim cache, shim, and shimvec appropriately
-                let shimElem''' := { shimElem'' with lwc := shimElem''.lwc + 1 }
-                let shimCache'' := shimCache'.set addr shimElem'''
-                let shim'' := { shim' with
-                    state := shimCache'',
-                    ocnt := shim'.ocnt + 1
-                }
-                let shimVec''' := shimVec''.set shim shim''
+    let currentQInd := shimVec[shim].qInd
 
-                let shimNode : Node c := Fin.castSucc shim
-                let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
-                -- let shimNode : Node c := Fin.castLT shim (Nat.lt_of_lt_of_le shim.isLt (Nat.le_succ c.threads))
+    -- 1. Mark instruction as complete (pend := false)
+    let instr' := {e[shim].list[currentQInd]! with pend := false}
+    let list' := e[shim].list.set currentQInd instr'
+    let e' := e.set shim {list := list', nonempty := (by unfold list'; simp; exact e[↑shim].nonempty)}
 
-                let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren shim''.ocnt 0 0 (maxSeenIdBoth shim'') 0 net msgIds
-                --
-                if stren = OpStrength.SC then
-                    let modShim := {shimVec'''[shim] with pendingWSC := true} --we set pendingWSC
-                    let shimVec'''' := shimVec''.set shim modShim
-                    (shimVec'''', e', net', msgIds')
-                else
-                    (shimVec''', e', net', msgIds')
+    -- 2. Increment qInd (PC) and check active state
+    let shimVec_advanced := popInstr shim shimVec e'
+
+    -- 3. Check sync bit and process cache
+    let shimElem' := shimVec_advanced[shim].state[addr]
+    if ((shimElem'.state = CacheState.Invalid) ∧ (shimElem'.syncBit = false)) then
+        panic! "Sync Bit improperly set"
+    else
+        let newTs : Timestamp := shimElem'.ts + 1
+        let shimVec'' := shimWriteCache shim CacheState.Valid data newTs addr shimVec_advanced
+
+        let shim' := shimVec''[shim]
+        let shimCache' := shim'.state
+        let shimElem'' := shimCache'[addr]
+        let shimElem''' := { shimElem'' with lwc := shimElem''.lwc + 1 }
+        let shimCache'' := shimCache'.set addr shimElem'''
+        let shim'' := { shim' with
+            state := shimCache'',
+            ocnt := shim'.ocnt + 1
+        }
+        let shimVec''' := shimVec''.set shim shim''
+
+        let shimNode : Node c := Fin.castSucc shim
+        let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+
+        let (net', msgIds') := send MType.WRITE shimNode CCNode data addr newTs stren shim''.ocnt 0 0 (maxSeenIdBoth shim'') currentQInd 0 net msgIds
+
+        if stren = OpStrength.SC then
+            let modShim := {shimVec'''[shim] with pendingWSC := true}
+            let shimVec'''' := shimVec'''.set shim modShim
+            (shimVec'''', e', net', msgIds')
+        else
+            (shimVec''', e', net', msgIds')
 -- mp
 -- Read value, or send RREQ to CC
--- def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
---     (shimVec : ShimType c) (net : NETOrdered c) (e : Execution c) (msgIds : MessageIds c) :
---     (ShimType c) × (NETOrdered c) × (Execution c) × (MessageIds c):=
---     let shimElem := ((shimVec[shim]).state)[addr]
---     if shimElem.state ≠ CacheState.Valid then
---         let shimNode := shim.castSucc
---         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
---         let (net', msgIds') := send MType.RREQ shimNode CCNode shimElem.data addr shimElem.ts stren net msgIds
---         (shimVec, net', e, msgIds')
---     else
---         let e' := updateVal shim shimElem.data e shimVec
---         let (shimVec', e'') := popInstr shim shimVec e'
---         (shimVec', net, e'', msgIds)
+def shimRead {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (stren : OpStrength)
+    (shimVec : ShimType c) (net : NETUnordered c) (e : Execution c) (msgIds : MessageIds c) :
+    (ShimType c) × (NETUnordered c) × (Execution c) × (MessageIds c):=
 
---   -- Stop local reads until FRESP received
-def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETUnordered c) (msgIds : MessageIds c) :
-    (ShimType c) × (NETUnordered c) × (MessageIds c) :=
-        let ocnt' := shimVec[shim].ocnt
-        let modShim := {shimVec[shim] with fencePending := true, ocnt := ocnt' + 1}
-        let shimVec' := shimVec.set shim modShim
+    let currentQInd := shimVec[shim].qInd
 
+    -- 1. Increment qInd (we always advance the PC)
+    let shimVec_advanced := popInstr shim shimVec e
+
+    let shimElem := shimVec_advanced[shim].state[addr]
+
+    if shimElem.state ≠ CacheState.Valid then
+        -- Cache Miss: Instruction remains pending (pend = true)
         let shimNode := shim.castSucc
         let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
-        let (net', msgIds') := sendFence MType.FREQ shimNode CCNode ocnt' net msgIds
-        (shimVec', net', msgIds')
+
+        -- Send RREQ stamped with currentQInd
+        let (net', msgIds') := send MType.RREQ shimNode CCNode shimElem.data addr shimElem.ts stren shimVec_advanced[shim].ocnt 0 0 0 currentQInd 0 net msgIds
+
+        -- Update ocnt
+        let shimVec_final := shimVec_advanced.set shim { shimVec_advanced[shim] with ocnt := shimVec_advanced[shim].ocnt + 1 }
+
+        (shimVec_final, net', e, msgIds')
+    else
+        -- Cache Hit: updateVal resolves the data and sets pend := false
+        let e' := updateVal shim shimElem.data currentQInd e
+        (shimVec_advanced, net, e', msgIds)
+
+--   -- Stop local reads until FRESP received
+def shimFence {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (net : NETUnordered c) (msgIds : MessageIds c) (e : Execution c) :
+    (ShimType c) × (NETUnordered c) × (Execution c) × (MessageIds c) :=
+
+    let currentQInd := shimVec[shim].qInd
+
+    -- 1. Mark instruction as complete (pend := false)
+    let instr' := {e[shim].list[currentQInd]! with pend := false}
+    let list' := e[shim].list.set currentQInd instr'
+    let e' := e.set shim {list := list', nonempty := (by unfold list'; simp; exact e[↑shim].nonempty)}
+
+    -- 2. Increment qInd and check active state
+    let shimVec_advanced := popInstr shim shimVec e'
+
+    let ocnt' := shimVec_advanced[shim].ocnt
+    let modShim := {shimVec_advanced[shim] with fencePending := true, ocnt := ocnt' + 1}
+    let shimVec' := shimVec_advanced.set shim modShim
+
+    let shimNode := shim.castSucc
+    let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
+
+    let (net', msgIds') := sendFence MType.FREQ shimNode CCNode ocnt' net msgIds
+
+    (shimVec', net', e', msgIds')
 
   -- CC: process messages -----------------------------------------------------
 -- Helper to fold over the filtered list of sharers and send WRITE messages
@@ -861,7 +859,7 @@ def foldSharersWrites {c : SystemConfig}
         -- Send the message
         let (n', ids') := send MType.WRITE CCNode sharer.castSucc msg.data msg.addr ts' msg.stren
             destCntrs.ocnt destCntrs.ccCounterElemPerAddr[msg.addr].fenceCount
-            srcSeen.writeId srcSeen.seenId destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount n ids
+            srcSeen.writeId srcSeen.seenId msg.qInd destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount n ids
 
         -- Increment ocnt for the sharer in the CC state
         let currCC' := { currCC with
@@ -914,7 +912,7 @@ def CCSendWriteAck {c : SystemConfig}
         -- Send the WRITE_ACK message
         let (net_ack, ids_ack) := send MType.WRITE_ACK CCNode msgSrcShim.castSucc msg.data msg.addr ts' msg.stren
             destCntrs.ocnt 0 -- 0 represents the empty fence count context here
-            srcSeen.writeId srcSeen.seenId destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount net msgIds
+            srcSeen.writeId srcSeen.seenId msg.qInd destCntrs.ccCounterElemPerAddr[msg.addr].localWriteCount net msgIds
 
         -- Increment ocnt for the source shim in the CC state
         let CC_ack := { CC with
@@ -1061,22 +1059,21 @@ def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Ex
 
 -- Call the appropriate functions given an instruction
 def getAndIssueInstr {c : SystemConfig} (shim : ShimId c) (state : IncState c) : IncState c :=
+    -- getInstr sets the initial pend := true
     let (e', instr) := getInstr shim state.shimVec state.execution
-    let state' := {state with execution := e'}
 
     match instr.access with
     | PermissionType.load =>
-        let (shimVec', net', e'', msgIds') := shimRead shim instr.addr instr.stren state'.shimVec state'.net state'.execution state'.msgIds
-        let state'' := {state' with shimVec := shimVec', net := net', execution := e'', msgIds := msgIds'}
-        state''
+        let (shimVec', net', e'', msgIds') := shimRead shim instr.addr instr.stren state.shimVec state.net e' state.msgIds
+        {state with shimVec := shimVec', net := net', execution := e'', msgIds := msgIds'}
+
     | PermissionType.store =>
-        let (shimVec', e'', net', msgIds') := shimWrite shim instr.addr instr.data instr.stren state'.shimVec state'.execution state'.net state'.msgIds
-        let state'' := {state' with shimVec := shimVec', execution := e'', net := net', msgIds := msgIds'}
-        state''
+        let (shimVec', e'', net', msgIds') := shimWrite shim instr.addr instr.data instr.stren state.shimVec e' state.net state.msgIds
+        {state with shimVec := shimVec', execution := e'', net := net', msgIds := msgIds'}
+
     | PermissionType.fence =>
-        let (shimVec', net', msgIds') := shimFence shim state'.shimVec state'.net state'.msgIds
-        let state'' := {state' with shimVec := shimVec', net := net', msgIds := msgIds'}
-        state''
+        let (shimVec', net', e'', msgIds') := shimFence shim state.shimVec state.net state.msgIds e'
+        {state with shimVec := shimVec', execution := e'', net := net', msgIds := msgIds'}
 
 def canIssueInstr {c : SystemConfig} (shimId : ShimId c) (state : IncState c) : Prop :=
     let shimStruct := state.shimVec[shimId]
