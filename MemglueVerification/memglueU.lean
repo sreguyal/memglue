@@ -52,7 +52,7 @@ inductive MType : Type where
     | FREQ
     | RRESP
     | FRESP
-deriving Repr
+deriving Repr, DecidableEq
 --TODO proof that na < rlx
 inductive OpStrength : Type where
     | RLX
@@ -256,6 +256,7 @@ structure Shim (c : SystemConfig) : Type where
     fencePending : Bool
     icnt : Nat
     ocnt : Nat
+    fenceCnt : Nat
     seenCache : SeenSet
     seenBuf : SeenSet
     msgBuf : MsgBuffer c
@@ -270,6 +271,7 @@ instance (c : SystemConfig) : Inhabited (Shim c) where
         fencePending := false
         icnt := 0
         ocnt := 0
+        fenceCnt := 0
         seenCache := { } -- default list?
         seenBuf := { }
         msgBuf := default
@@ -413,6 +415,23 @@ def cullSeenSet {c : SystemConfig} (s : Shim c) : Shim c :=
       seenCache := [maxVal],
       seenBuf := []
   }
+
+def sameAddrReadsInQueue {c : SystemConfig} (shim : ShimId c) (qInd : QInd) (addr : Addr c) (shimVec : ShimType c) (e : Execution c) : Bool :=
+    let instrs := e[shim].list
+    -- Iterate from index 0 to qInd - 1
+    let rec checkIdx (i : Nat) : Bool :=
+        if i >= qInd then false
+        else if i < instrs.length then
+            let instr := instrs[i]!
+            if instr.pend ∧ instr.addr = addr then true
+            else checkIdx (i + 1)
+        else false
+    checkIdx 0
+
+def acceptRRESPEarly {c : SystemConfig} (shim : ShimId c) (msg : Message c) (shimVec : ShimType c) (e : Execution c) : Bool :=
+    let noSameAddrRead := !(sameAddrReadsInQueue shim msg.qInd msg.addr shimVec e)
+    let cacheTs := shimVec[shim].state[msg.addr].ts
+    noSameAddrRead ∧ (msg.ts <= cacheTs)
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
@@ -583,70 +602,169 @@ def ts1shimvec := shimIncrTS (0 : ShimId default) (0 : Addr default) (default : 
 #eval shimIncrTS (0 : ShimId default) (0 : Addr default) ts1shimvec
 
 -- -- SHIM: incoming messages
-def shimReceive {c : SystemConfig} (shim : ShimId c) (msg : Message c)
+def shimReceive {c : SystemConfig} (shim : ShimId c) (msg : Message c) (inOrder : Bool)
                 (shimVec : ShimType c) (e : Execution c)
                 : (ShimType c) × (Execution c) :=
-    if h1 : msg.dst < c.threads.val then    -- msg.dst is in fact a shim
-        let curShim : ShimId c := shim      --⟨msg.dst, h1⟩
+    if h1 : msg.dst.val < c.threads.val then
+        let curShim : ShimId c := ⟨msg.dst.val, h1⟩
         let curShimCache : ShimCache c := (shimVec[curShim]).state
         let addr := msg.addr
 
         match msg.mtype with
             | MType.WRITE =>
                 let shimElem : ShimElemState := curShimCache[addr]
-                if msg.ts > shimElem.ts then
+
+                let (shimVec', e') := if msg.ts > shimElem.ts then
                     (shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec, e)
                 else
                     (shimIncrTS curShim addr shimVec, e)
+
+                -- Handle SeenIds based on inOrder
+                let modShim := shimVec'[curShim]
+                let finalShim := if inOrder then
+                    if inSeenSet modShim msg.writeId then modShim else { modShim with seenCache := modShim.seenCache ++ [msg.writeId] }
+                else
+                    if inSeenSetShimBuf modShim msg.writeId then modShim else { modShim with seenBuf := modShim.seenBuf ++ [msg.writeId] }
+
+                let finalShimVec := shimVec'.set curShim finalShim
+                (finalShimVec, e')
+
             | MType.WRITE_ACK =>
                 let shimElem : ShimElemState := curShimCache[addr]
-                if shimElem.syncBit = true then
-                    let newTs : Timestamp := msg.ts+shimElem.ts-1
-                    let modShims : ShimType c := shimWriteCache curShim CacheState.Valid shimElem.data newTs addr shimVec
-                    let modShimElem : ShimElemState := {(modShims[curShim]).state[addr] with syncBit := false}
-                    let modShimCache : ShimCache c := (modShims[curShim]).state.set addr modShimElem
-                    let modShim : Shim c := {(modShims[curShim]) with state := modShimCache, pendingWSC := false}
 
-                    let newShimVec : ShimType c := modShims.set curShim modShim
-                    (newShimVec, e)
+                let shimVec' := if shimElem.syncBit = true then
+                    let data' := if shimElem.lwc > 1 then shimElem.data else msg.data
+                    let ts' := msg.ts + shimElem.lwc - 1
+                    let modShims : ShimType c := shimWriteCache curShim CacheState.Valid data' ts' addr shimVec
+                    let modShimElem : ShimElemState := { modShims[curShim].state[addr] with syncBit := false }
+                    let modShimCache : ShimCache c := modShims[curShim].state.set addr modShimElem
+                    modShims.set curShim { modShims[curShim] with state := modShimCache }
                 else
-                    let modShim : Shim c := {(shimVec[curShim]) with pendingWSC := false}
-                    let newShimVec : ShimType c := shimVec.set curShim modShim
-                    (newShimVec, e)
+                    shimVec
+
+                let finalShimVec := if shimVec'[curShim].pendingWSC then
+                    shimVec'.set curShim { shimVec'[curShim] with pendingWSC := false }
+                else
+                    shimVec'
+
+                (finalShimVec, e)
+
             | MType.RRESP =>
-                let modShims : ShimType c := shimWriteCache curShim CacheState.Valid msg.data msg.ts addr shimVec
-                let modShimElem : ShimElemState := {(modShims[curShim]).state[addr] with syncBit := false}
-                let modShimCache : ShimCache c := (modShims[curShim]).state.set addr modShimElem
-                let modShim : Shim c := {(modShims[curShim]) with state := modShimCache}
-                let modShims' : ShimType c := modShims.set curShim modShim
+                let shimElem : ShimElemState := curShimCache[addr]
 
-                let e' : Execution c := updateVal curShim msg.data e shimVec
-                let (newShimVec, e'') := popInstr curShim modShims' e'
+                -- Determine actual data based on syncBit/lwc overrides
+                let data' := if shimElem.syncBit ∧ shimElem.lwc > 0 then shimElem.data else msg.data
+
+                let shimVec' := if shimElem.syncBit then
+                    let ts' := msg.ts + shimElem.lwc
+                    let modShims := shimWriteCache curShim CacheState.Valid data' ts' addr shimVec
+                    let modShimElem := { modShims[curShim].state[addr] with syncBit := false }
+                    modShims.set curShim { modShims[curShim] with state := modShims[curShim].state.set addr modShimElem }
+                else
+                    if shimElem.ts <= msg.ts then
+                        shimWriteCache curShim CacheState.Valid data' msg.ts addr shimVec
+                    else
+                        shimVec
+
+                -- Handle SeenIds
+                let modShim := shimVec'[curShim]
+                let seenShim := if inOrder then
+                    if inSeenSet modShim msg.writeId then modShim else { modShim with seenCache := modShim.seenCache ++ [msg.writeId] }
+                else
+                    if inSeenSetShimBuf modShim msg.writeId then modShim else { modShim with seenBuf := modShim.seenBuf ++ [msg.writeId] }
+                let finalShimVec := shimVec'.set curShim seenShim
+
+                -- Update test values and pop instruction
+                let e' : Execution c := updateVal curShim data' e finalShimVec
+                let (newShimVec, e'') := popInstr curShim finalShimVec e'
                 (newShimVec, e'')
-            | MType.FRESP =>
-                let modShim : Shim c := {(shimVec[curShim]) with fencePending := false}
-                let modShimVec : ShimType c := shimVec.set curShim modShim
 
-                if (shimVec[curShim]).pendingWSC = false then
+            | MType.FREQ =>
+                let modShim := { shimVec[curShim] with fenceCnt := shimVec[curShim].fenceCnt + 1 }
+                (shimVec.set curShim modShim, e)
+
+            | MType.FRESP =>
+                let modShim := { shimVec[curShim] with fencePending := false }
+                let modShimVec := shimVec.set curShim modShim
+
+                -- Pop instruction conditionally based on pendingWSC
+                if shimVec[curShim].pendingWSC = false then
                     let (newShimVec, newExec) := popInstr curShim modShimVec e
                     (newShimVec, newExec)
                 else
-                    let modShim' := {(shimVec[curShim]) with pendingWSC := false}
-                    let newShimVec : ShimType c := modShimVec.set curShim modShim'
+                    let modShim' := { modShimVec[curShim] with pendingWSC := false }
+                    let newShimVec := modShimVec.set curShim modShim'
                     (newShimVec, e)
+
             | _ => panic! "message with wrong message type was passed into ShimReceive"
     else
-        panic! "message with destination that was not a shim was passed into ShimReceive (was CC or some other random dst value)"
+        panic! "message with destination that was not a shim was passed into ShimReceive"
+
+def shimAcceptMessage {c : SystemConfig} (shim : ShimId c) (msg : Message c) (shimVec : ShimType c) (e : Execution c) : Bool :=
+    let s := shimVec[shim]
+    let isFence : Bool := msg.mtype == MType.FREQ || msg.mtype == MType.FRESP
+
+    if s.fencePending || (!isFence && s.fenceCnt < msg.fenceCnt) then
+        false
+    else if !isFence && s.state[msg.addr].syncBit then
+        false
+    else if msg.mtype == MType.WRITE_ACK then
+        false
+    else
+        match msg.mtype with
+        | MType.WRITE =>
+            let cacheState := s.state[msg.addr]
+            if msg.ts + cacheState.lwc - msg.wCnt != cacheState.ts + 1 then
+                false
+            else
+                match msg.stren with
+                | OpStrength.RLX => true
+                | OpStrength.REL => inSeenSet s msg.seenId
+                | _ => false -- SC
+        | MType.RRESP =>
+            if !acceptRRESPEarly shim msg shimVec e then
+                false
+            else
+                match msg.stren with
+                | OpStrength.RLX => true
+                | OpStrength.ACQ => inSeenSet s msg.seenId
+                | _ => false -- SC
+        | MType.FREQ => false
+        | MType.FRESP => false
+        | _ => false
 
 def shimReceiveAndPopMsg {c : SystemConfig} (shim : ShimId c) (state : IncState c) : IncState c :=
     let shimNode : Node c := shim.castSucc
-    let msg := (state.net[shimNode]).head!
-    let (shimVec', e') := shimReceive shim msg state.shimVec state.execution
-    let state' := {state with shimVec := shimVec', execution := e'}
+    let msg := state.net[shimNode].head!
+    let expectedIcnt := state.shimVec[shim].icnt
 
-    let net' := popMessage shimNode state'.net
-    let state'' := {state' with net := net'}
-    state''
+    if msg.cnt = expectedIcnt then
+        -- IN-ORDER
+        let shimVec_icnt := state.shimVec.set shim { state.shimVec[shim] with icnt := expectedIcnt + 1 }
+
+        let (shimVec', e') := shimReceive shim msg true shimVec_icnt state.execution
+        let net' := popMessage shimNode state.net
+
+        { state with shimVec := shimVec', execution := e', net := net' }
+    else
+        -- OUT-OF-ORDER
+        if shimAcceptMessage shim msg state.shimVec state.execution then
+            -- Early acceptance
+            let (shimVec', e') := shimReceive shim msg false state.shimVec state.execution
+
+            -- Push to buffer
+            let shimBuf' := shimVec'[shim].msgBuf ++ [msg]
+            let shimVec'' := shimVec'.set shim { shimVec'[shim] with msgBuf := shimBuf' }
+
+            let net' := popMessage shimNode state.net
+            { state with shimVec := shimVec'', execution := e', net := net' }
+        else
+            -- Push to buffer without processing
+            let shimBuf' := state.shimVec[shim].msgBuf ++ [msg]
+            let shimVec' := state.shimVec.set shim { state.shimVec[shim] with msgBuf := shimBuf' }
+
+            let net' := popMessage shimNode state.net
+            { state with shimVec := shimVec', net := net' }
 
 
 -- SHIM: outgoing messages
