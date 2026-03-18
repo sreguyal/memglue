@@ -924,6 +924,25 @@ def CCSendWriteAck {c : SystemConfig}
         -- If conditions aren't met, return state unmodified
         (net, msgIds, CC)
 
+def CCAddSrcShimToSharers {c : SystemConfig} (CC : CCMachine c) (msg : Message c) : CCMachine c :=
+    if h : msg.src.val < c.threads.val then
+        -- Safely cast the Node ID to a Shim ID using the proof 'h'
+        let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
+
+        -- Extract the current cache element for the message's address
+        let cacheElem := CC.cache[msg.addr]
+
+        -- Set the sharer boolean to true for this specific shim
+        let updatedSharers := cacheElem.sharers.set msgSrcShim true
+
+        -- Rebuild the nested state structures
+        let updatedCacheElem := { cacheElem with sharers := updatedSharers }
+        let updatedCache := CC.cache.set msg.addr updatedCacheElem
+
+        { CC with cache := updatedCache }
+    else
+        panic! "Source of message to the CC was the CC itself (invalid shim ID)"
+
 def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NETUnordered c) (msgIds : MessageIds c)
 : (CCMachine c) × (NETUnordered c) × (MessageIds c) :=
     let CCNode : Node c := Fin.mk c.threads (Nat.lt_succ_self c.threads)
@@ -1005,12 +1024,89 @@ def CCReceive {c : SystemConfig} (msg : Message c) (CC : CCMachine c) (net : NET
         else
             panic! "source of message to the CC was the CC??"
     | MType.RREQ =>
-        let CC' := CCAddSrcShimToSharers CC msg
-        let (net', msgIds') := send MType.RRESP CCNode msg.src (CC.cache[msg.addr]).data msg.addr (CC.cache[msg.addr]).ts msg.stren net msgIds
-        (CC', net', msgIds')
-    | MType.FREQ => --SendFence(FRESP,0,msg.src);
-        let (net', msgIds') := sendFence MType.FRESP CCNode msg.src net msgIds
-        (CC, net', msgIds')
+        if h : msg.src.val < c.threads.val then
+            let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
+            let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
+
+            -- 1. Add shim to sharers
+            let CC' := CCAddSrcShimToSharers CC msg
+
+            let lastWriteShim := CC'.cache[msg.addr].lastWriteShim
+            let isInitialData := lastWriteShim.val == c.threads.val -- In Lean, CC node acts as '0' initial state
+
+            let destCntrs := CC'.counters[msgSrcShim]
+            let destFenceCnt := destCntrs.ccCounterElemPerAddr[msg.addr].fenceCount
+
+            -- 2. Determine writeId, seenId, and seenPerShim updates
+            let (wId, sId, updatedSeenPerShim) := if isInitialData then
+                (0, 0, CC'.seenIds[msgSrcShim].seenPerShim)
+            else
+                let lastShimId : ShimId c := ⟨lastWriteShim.val, sorry⟩ -- Safe if not initial data
+                let srcSeen := (CC'.seenIds[lastShimId]).ccSeenIdsPerAddr[msg.addr]
+
+                let newSeenPerShim := if srcSeen.writeId > CC'.seenIds[msgSrcShim].seenPerShim then
+                    srcSeen.writeId
+                else
+                    CC'.seenIds[msgSrcShim].seenPerShim
+
+                (srcSeen.writeId, srcSeen.seenId, newSeenPerShim)
+
+            -- 3. Send RRESP
+            let (net', msgIds') := send MType.RRESP CCNode msg.src (CC'.cache[msg.addr]).data msg.addr (CC'.cache[msg.addr]).ts msg.stren
+                destCntrs.ocnt destFenceCnt wId sId msg.qInd 0 net msgIds
+
+            -- 4. Update CC counters and seenIds
+            let shimSeen := CC'.seenIds[msgSrcShim]
+            let CC'' := { CC' with
+                seenIds := CC'.seenIds.set msgSrcShim { shimSeen with seenPerShim := updatedSeenPerShim },
+                counters := CC'.counters.set msgSrcShim { destCntrs with ocnt := destCntrs.ocnt + 1 }
+            }
+
+            (CC'', net', msgIds')
+        else
+            panic! "source of RREQ was not a valid shim"
+
+    | MType.FREQ =>
+        if h : msg.src.val < c.threads.val then
+            let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
+            let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
+
+            -- 1. Broadcast FREQ to all OTHER shims
+            let (net', msgIds', CC') := List.foldl (fun (n, ids, currCC) (shim : ShimId c) =>
+                if shim.val != msgSrcShim.val then
+                    let destCntrs := currCC.counters[shim]
+
+                    -- Increment fence count
+                    let addrCntr := destCntrs.ccCounterElemPerAddr[msg.addr]
+                    let updatedAddrCntr := { addrCntr with fenceCount := addrCntr.fenceCount + 1 }
+                    let updatedDestCntrs := { destCntrs with
+                        ccCounterElemPerAddr := destCntrs.ccCounterElemPerAddr.set msg.addr updatedAddrCntr,
+                        ocnt := destCntrs.ocnt + 1
+                    }
+
+                    -- Note: Lean sendFence does not take stren like Murphi does
+                    let (n', ids') := sendFence MType.FREQ CCNode shim.castSucc destCntrs.ocnt n ids
+
+                    let currCC' := { currCC with
+                        counters := currCC.counters.set shim updatedDestCntrs
+                    }
+                    (n', ids', currCC')
+                else
+                    (n, ids, currCC)
+            ) (net, msgIds, CC) (List.finRange c.threads)
+
+            -- 2. Send FRESP to the requesting shim
+            let srcCntrs := CC'.counters[msgSrcShim]
+            let (net'', msgIds'') := sendFence MType.FRESP CCNode msg.src srcCntrs.ocnt net' msgIds'
+
+            -- 3. Update CC ocnt for the source shim
+            let CC'' := { CC' with
+                counters := CC'.counters.set msgSrcShim { srcCntrs with ocnt := srcCntrs.ocnt + 1 }
+            }
+
+            (CC'', net'', msgIds'')
+        else
+            panic! "source of FREQ was not a valid shim"
     | _ => panic! "CC received message of invalid type"
 
 def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
