@@ -433,6 +433,9 @@ def acceptRRESPEarly {c : SystemConfig} (shim : ShimId c) (msg : Message c) (shi
     let noSameAddrRead := !(sameAddrReadsInQueue shim msg.qInd msg.addr shimVec e)
     let cacheTs := shimVec[shim].state[msg.addr].ts
     noSameAddrRead ∧ (msg.ts <= cacheTs)
+
+def removeNth {α : Type} (l : List α) (n : Nat) : List α :=
+  l.take n ++ l.drop (n + 1)
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
@@ -1118,19 +1121,29 @@ def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
         let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
         let expectedIcnt := state.cc.counters[msgSrcShim].icnt
 
-        if msg.cnt = expectedIcnt then
-            -- IN-ORDER: Process the message
+        -- Allow relaxed operations to bypass strict sequence enforcement
+        let isRelaxed := msg.stren == OpStrength.RLX
+
+        if msg.cnt = expectedIcnt ∨ isRelaxed then
+            -- IN-ORDER or RELAXED: Process the message
             let (cc', net', msgIds') := CCReceive msg state.cc state.net state.msgIds
-            -- Increment the CC's icnt for this specific shim
+
+            -- Increment the CC's icnt ONLY if it matches the expected sequence.
+            -- If we process an out-of-order RLX message, leave icnt alone
+            -- so older bypassed messages do not fail the expectedIcnt check later.
             let shimCntrs := cc'.counters[msgSrcShim]
-            let cc'' := { cc' with
-                counters := cc'.counters.set msgSrcShim { shimCntrs with icnt := shimCntrs.icnt + 1 }
-            }
+            let cc'' := if msg.cnt = expectedIcnt then
+                { cc' with
+                    counters := cc'.counters.set msgSrcShim { shimCntrs with icnt := shimCntrs.icnt + 1 }
+                }
+            else
+                cc'
+
             let net'' := popMessage CCNode net'
             { state with cc := cc'', net := net'', msgIds := msgIds' }
 
         else
-            -- OUT-OF-ORDER: Push to the CC buffer and skip processing
+            -- OUT-OF-ORDER (and not relaxed): Push to the CC buffer and skip processing
             let ccBuf' := state.cc.buf ++ [msg]
             let cc' := { state.cc with buf := ccBuf' }
             let net' := popMessage CCNode state.net
@@ -1138,6 +1151,48 @@ def CCReceiveAndPopMsg {c : SystemConfig} (state : IncState c) : IncState c :=
 
     else
         panic! "CC received a message from an invalid source (not a shim)"
+
+def CCReceiveAndPopMsgAt {c : SystemConfig} (state : IncState c) (msgIdx : Nat) : IncState c :=
+    let CCNode : Node c := ⟨c.threads, Nat.lt_succ_self c.threads⟩
+    let ccQueue := state.net[CCNode]
+
+    if h_bounds : msgIdx < ccQueue.length then
+        let msg := ccQueue[msgIdx] -- Valid due to the user's GetElem instance
+
+        -- Verify the message source is a valid shim
+        if h : msg.src.val < c.threads.val then
+            let msgSrcShim : ShimId c := ⟨msg.src.val, h⟩
+            let expectedIcnt := state.cc.counters[msgSrcShim].icnt
+            let isRelaxed := msg.stren == OpStrength.RLX
+
+            if msg.cnt = expectedIcnt ∨ isRelaxed then
+                -- IN-ORDER or RELAXED
+                let (cc', net', msgIds') := CCReceive msg state.cc state.net state.msgIds
+
+                let shimCntrs := cc'.counters[msgSrcShim]
+                let cc'' := if msg.cnt = expectedIcnt then
+                    { cc' with
+                        counters := cc'.counters.set msgSrcShim { shimCntrs with icnt := shimCntrs.icnt + 1 }
+                    }
+                else
+                    cc'
+
+                -- Remove the specific message instead of the head
+                let newQueue := removeNth (net'[CCNode]) msgIdx
+                let net'' := net'.set CCNode.val newQueue
+
+                { state with cc := cc'', net := net'', msgIds := msgIds' }
+            else
+                -- OUT-OF-ORDER (and not relaxed): Push to buffer, remove from network
+                let ccBuf' := state.cc.buf ++ [msg]
+                let cc' := { state.cc with buf := ccBuf' }
+                let newQueue := removeNth ccQueue msgIdx
+                let net' := state.net.set CCNode.val newQueue
+                { state with cc := cc', net := net' }
+        else
+            panic! "CC received a message from an invalid source"
+    else
+        state -- Fallback for invalid index
 
 def getInstr {c : SystemConfig} (shim : ShimId c) (shimVec : ShimType c) (e : Execution c)
 : (Execution c) × (Instr c) :=
@@ -1232,11 +1287,17 @@ inductive increment_step {c : SystemConfig} : IncState c → IncState c → Prop
                 (s.net[(shim.castSucc)]).length > 0 →
                 s' = shimReceiveAndPopMsg shim s →
                 increment_step s s'
-    | CCProcessMsg : forall (s s' : IncState c),
-                (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)]).length > 0 →
-                valid_CCReceive_MType (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)].head!).mtype →
-                ↑(s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)].head!).src.val < (↑c.threads.val) →
-                s' = CCReceiveAndPopMsg s →
+    -- | CCProcessMsg : forall (s s' : IncState c),
+    --             (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)]).length > 0 →
+    --             valid_CCReceive_MType (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)].head!).mtype →
+    --             ↑(s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)].head!).src.val < (↑c.threads.val) →
+    --             s' = CCReceiveAndPopMsg s →
+    --             increment_step s s'
+    | CCProcessMsg : forall (s s' : IncState c) (idx : Nat),
+                idx < (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)]).length →
+                valid_CCReceive_MType (s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)][idx]!).mtype →
+                ↑(s.net[Fin.mk c.threads (Nat.lt_succ_self c.threads)][idx]!).src.val < (↑c.threads.val) →
+                s' = CCReceiveAndPopMsgAt s idx →
                 increment_step s s'
     | Finish : forall (s s' : IncState c),
              s.done = false → isDone s → s' = {s with done := true} →
@@ -1261,381 +1322,3 @@ inductive increment_reachable {c : SystemConfig} : IncState c → Prop where
 
 def end_state {c : SystemConfig} (s : IncState c) : Prop :=
   s.done = true ∧ increment_reachable s
-
--- example
--- namespace small_example
--- def starting_state : IncState default :=
--- {   cc := default
---     shimVec := default
---     net := default
---     execution := default
---     done := default
--- }
--- -- proof that starting_state is a valid initial state (proved by IncInit)
--- example : increment_init starting_state := increment_init.IncInit (default : Execution default)
-
--- def next_state : IncState default := getAndIssueInstr 1 starting_state
--- #eval next_state
--- example : increment_step starting_state next_state :=
--- increment_step.ProcessInstr starting_state next_state 1
---     (by
---       unfold canIssueInstr
---     --   simp [getAndIssueInstr]
---       exact if_false_right.mp rfl
---     )
--- end small_example
-
-
-
-/-Inductive increment_step : increment_state -> increment_state -> Prop :=
-| IncLock : forall g,
-  increment_step {| Shared := {| Locked := false; Global := g |};
-                    Private := Lock |}
-                 {| Shared := {| Locked := true; Global := g |};
-                    Private := Read |}
-| IncRead : forall l g,
-  increment_step {| Shared := {| Locked := l; Global := g |};
-                    Private := Read |}
-                 {| Shared := {| Locked := l; Global := g |};
-                    Private := Write g |}
-| IncWrite : forall l g v,
-  increment_step {| Shared := {| Locked := l; Global := g |};
-                    Private := Write v |}
-                 {| Shared := {| Locked := l; Global := S v |};
-                    Private := Unlock |}
-| IncUnlock : forall l g,
-  increment_step {| Shared := {| Locked := l; Global := g |};
-                    Private := Unlock |}
-                 {| Shared := {| Locked := false; Global := g |};
-                    Private := Done |}.-/
-
-
-
-
-
-
-
------------------------------------------------------------------
--- TESTING functions --------------------------------------------
-----------------------------------------------------------------
--- def litmusEx : Execution (default : SystemConfig) :=
---     fun (t : ShimId default) =>
---         fun (s : QInd default) =>
---             match t, s with
---             | 0, 0 => {(default : Instr default) with access := PermissionType.store, addr := 0, data := 1}
---             | 0, 1 => {(default : Instr default) with access := PermissionType.store, addr := 1, data := 1}
---             | 1, 0 => {(default : Instr default) with access := PermissionType.load, addr := 1, data := 1}
---             | 1, 1 => {(default : Instr default) with access := PermissionType.load, addr := 0, data := 1}
-
----------------------------------------------------------------------------
--- namespace test1
--- def shimVec := (default : ShimType default)
--- #eval shimVec
--- def net := (default : NETOrdered default)
--- #eval net
--- def cc := (default : CCMachine default)
--- #eval cc
--- def out := (default : Output default)
--- #eval out
--- -- TEST 1: MP: start with x, y invalid in both shims
--- --  shim1Write -> CCReceive WRITE -> shim1Write -> CCReceive WRITE ->
--- --  shim2Read -> CCReceive RREQ -> shim2Receive RRESP (y=1) -> shim1Receive WRITE_ACK (syncbit = off)
-
--- def res1 := getInstr (0 : ShimId default) shimVec litmusEx
--- def litmusEx' := res1.1
--- def instr1 := res1.2
--- #eval litmusEx'
--- #eval instr1
--- -- def shimWrite {c : SystemConfig} (shim : ShimId c) (addr : Addr c) (data : Data) (stren : OpStrength)
---             --   (shimVec : ShimType c) (e : Execution c) (net : NETOrdered c) : shimtype x execution x net
-
--- def res2 := shimWrite (0 : ShimId default) instr1.addr instr1.data instr1.stren shimVec litmusEx' net
--- def shimVec' : ShimType default := res2.1
--- def litmusEx'' : Execution default := res2.2.1
--- def net' : NETOrdered default := res2.2.2
--- #eval shimVec'
--- #eval litmusEx''
--- #eval net'
-
--- -- Message c → CCMachine c → NETOrdered c → CCMachine c × NETOrdered c
--- def res3 := CCReceive (net'.get 2).head! cc net'
--- def cc' := res3.1
--- def net'' := res3.2
--- #eval cc'
--- #eval net''
--- -- popMessage {c : SystemConfig} (dst : Node c) (net : NETOrdered c) : NETOrdered c
--- def net''' := popMessage 2 net''
--- #eval net'''
--- -- Wx = 1 done
-
--- def res4 := getInstr (0 : ShimId default) shimVec' litmusEx''
--- def litmusEx''' := res4.1
--- def instr2 := res4.2
--- #eval litmusEx'''
--- #eval instr2
-
--- def res5 := shimWrite (0 : ShimId default) instr2.addr instr2.data instr2.stren shimVec' litmusEx''' net'''
--- def shimVec'' : ShimType default := res5.1
--- def litmusEx'''' : Execution default := res5.2.1
--- def net'''' : NETOrdered default := res5.2.2
--- #eval shimVec''
--- #eval litmusEx''''
--- #eval net''''
-
--- def res6 := CCReceive (net''''.get 2).head! cc' net''''
--- def cc'' := res6.1
--- def net''''' := res6.2
--- #eval cc''
--- #eval net'''''
--- def net6 := popMessage 2 net'''''
--- #eval net6
--- -- Wy = 1 done
-
--- def res7 := getInstr (1 : ShimId default) shimVec'' litmusEx''''
--- def litmusEx5 := res7.1
--- def instr3 := res7.2
--- #eval litmusEx5
--- #eval instr3
-
--- def res8 := shimRead (1 : ShimId default) instr3.addr instr3.stren shimVec'' net6 litmusEx5 out
--- def shimVec3 := res8.1
--- def net7 : NETOrdered default := res8.2.1
--- def LitmusEx6 : Execution default := res8.2.2.1
--- def output1 : Output default := res8.2.2.2
--- #eval shimVec3
--- #eval net7
--- #eval LitmusEx6
--- #eval output1
-
--- def res9 := CCReceive (net7.get 2).head! cc'' net7
--- def cc3 := res9.1
--- def net8 := res9.2
--- #eval cc3
--- #eval net8
--- def net9 := popMessage 2 net8
--- #eval net9
-
--- -- SHIM: incoming messages
--- -- def shimReceive {c : SystemConfig} (msg : Message c)
---                 -- (shimVec : ShimType c) (e : Execution c) (o : Output c)
---                 -- : (ShimType c) × (Execution c) × (Output c)
--- def res10 := shimReceive (net9.get 1).head! shimVec3 LitmusEx6 output1
--- def shimVec4 := res10.1
--- def litmusEx7 := res10.2.1
--- def out2 := res10.2.2
--- #eval shimVec4
--- #eval litmusEx7
--- #eval out2
--- def net10 := popMessage 1 net9
--- #eval net10
-
--- def res11 := shimReceive (net10.get 0).head! shimVec4 litmusEx7 out2
--- def shimVec5 := res11.1
--- def litmusEx8 := res11.2.1
--- def out3 := res11.2.2
--- #eval shimVec5
--- #eval litmusEx8
--- #eval out3
--- end test1
-
--- ----------------------------------------------------------------------
--- -- TEST 2: MP: S1 caches x; S2 caches y initially
--- -- Shim2Read y=0 -> Shim1Write x=1 -> CCReceive WRITEx=1 -> Shim2Read
--- -- CCreceive RREQ x -> Shim2Receive RRESP x=1
--- namespace test2
--- def shimcache1 := (default : ShimCache default).set 0 {(default : ShimElemState) with state := CacheState.Valid}
--- def shim1 := {(default : Shim default) with state := shimcache1}
--- def shimcache2 := (default : ShimCache default).set 1 {(default : ShimElemState) with state := CacheState.Valid}
--- def shim2 := {(default : Shim default) with state := shimcache2}
--- def shimVec := ((default : ShimType default).set 0 shim1).set 1 shim2
--- #eval shimVec
--- def net := (default : NETOrdered default)
--- #eval net
--- def ccelem1 := {(default : CCElemState default) with sharers := ((default : Vector Bool (default : SystemConfig).threads).set 0 true)}
--- def ccelem2 := {(default : CCElemState default) with sharers := ((default : Vector Bool (default : SystemConfig).threads).set 1 true)}
--- def cccache := ((default : CCCache default).set 0 ccelem1).set 1 ccelem2
--- def cc := {(default : CCMachine default) with cache := cccache}
--- #eval cc
--- def out := (default : Output default)
--- #eval out
-
--- -- Shim2Read y=0 -> Shim1Write x=1 -> CCReceive WRITEx=1 -> Shim2Read
--- -- CCreceive RREQ x -> Shim2Receive RRESP x=1
--- def res1 := getInstr (1 : ShimId default) shimVec litmusEx
--- def e1 : Execution default := res1.1
--- def i1 : Instr default := res1.2
--- #eval e1
--- #eval i1
--- def res2 := shimRead (1 : ShimId default) i1.addr i1.stren shimVec net e1 out
--- def sv1 : ShimType default := res2.1
--- def net1 : NETOrdered default := res2.2.1
--- def e2 : Execution default := res2.2.2.1
--- def o1 : Output default := res2.2.2.2
--- #eval sv1
--- #eval net1
--- #eval e2
--- #eval o1
--- -- if we immediately process the Ry=1 in thread 2, is it supposed to read with timestamp 0? seems like murphi does this too but check
-
--- def res3 := getInstr 0 sv1 e2
--- def e3 := res3.1
--- def i2 := res3.2
--- def res4 := shimWrite 0 i2.addr i2.data i2.stren sv1 e3 net1
--- def sv2 := res4.1
--- def e4 := res4.2.1
--- def net2 := res4.2.2
--- #eval sv2
--- #eval e4
--- #eval net2
-
--- def res5 := getInstr 1 sv2 e4
--- def e5 := res5.1
--- def i3 := res5.2
--- #eval e5
--- #eval i2
--- def res6 := shimRead 1 i3.addr i3.stren sv2 net2 e4 o1
--- def sv3 := res6.1
--- def net3 := res6.2.1
--- def e6 := res6.2.2.1
--- def o2 := res6.2.2.2
--- #eval sv3
--- #eval net3
--- #eval e6
--- #eval o2
--- -- ccreceive write x=1
--- def res7 := CCReceive (net3.get 2).head! cc net3
--- def cc1 := res7.1
--- def net4 := res7.2
--- #eval cc1
--- #eval net4
--- def net5 := popMessage 2 net4
--- #eval net5
--- -- ccreceive RREQ for x
--- def res8 := CCReceive (net5.get 2).head! cc1 net5
--- def cc2 := res8.1
--- def net6 := res8.2
--- #eval cc2
--- #eval net6
--- def net7 := popMessage 2 net6
--- #eval net7
--- -- shimReceive RRESP for x
--- def res9 := shimReceive (net7.get 1).head! sv3 e6 o2
--- def sv4 := res9.1
--- def e7 := res9.2.1
--- def o3 := res9.2.2
--- #eval sv4
--- #eval e7
--- #eval o3
--- end test2
-
-
--- -----------------------------------------------------------
--- -- test3 : storebuffer:
--- -- don't process any memglue messages, just do instructions and read 0's
--- -- setup: both shims cache all addresses at start (all valid)
--- namespace test3
--- def litmusEx : Execution (default : SystemConfig) :=
---     fun (t : ShimId default) =>
---         fun (s : QInd default) =>
---             match t, s with
---             | 0, 0 => {(default : Instr default) with access := PermissionType.store, addr := 0, data := 1}
---             | 0, 1 => {(default : Instr default) with access := PermissionType.load, addr := 1, data := 0}
---             | 1, 0 => {(default : Instr default) with access := PermissionType.store, addr := 1, data := 1}
---             | 1, 1 => {(default : Instr default) with access := PermissionType.load, addr := 0, data := 0}
--- def shimVec1 := (default : ShimType default)
--- def out1 := (default : Output default)
--- def net1 := (default : NETOrdered default)
-
--- def res1 := getInstr 1 shimVec1 litmusEx
---     def e1 := res1.1
---     def i1 := res1.2
---     #eval e1
---     #eval i1
--- def res2 := shimWrite 1 i1.addr i1.data i1.stren shimVec1 e1 net1
---     def shimVec2 := res2.1
---     def e2 := res2.2.1
---     def net2 := res2.2.2
---     #eval shimVec2
---     #eval e2
---     #eval net2
-
--- def res3 := getInstr 1 shimVec2 e2
---     def e3 := res3.1
---     def i2 := res3.2
---     #eval e3
---     #eval i2
--- def res4 := shimRead 1 i2.addr i2.stren shimVec2 net2 e3 out1
---     def shimVec3 := res4.1
---     def net3 : NETOrdered default := res4.2.1
---     def e4 := res4.2.2.1
---     def out2 := res4.2.2.2
---     #eval shimVec3
---     #eval net3
---     #eval e4
---     #eval out2
-
--- def res5 := getInstr 0 shimVec3 e4
---     def e5 := res5.1
---     def i3 := res5.2
---     #eval e5
---     #eval i3
--- def res6 := shimWrite 0 i3.addr i3.data i3.stren shimVec3 e5 net3
---     def shimVec4 := res6.1
---     def e6 := res6.2.1
---     def net4 := res6.2.2
---     #eval shimVec4
---     #eval e6
---     #eval net4
-
--- def res7 := getInstr 0 shimVec4 e6
---     def e7 := res7.1
---     def i4 := res7.2
---     #eval e7
---     #eval i4
--- def res8 := shimRead 0 i4.addr i4.stren shimVec4 net4 e7 out2
---     def shimVec5 := res8.1
---     def net5 : NETOrdered default := res8.2.1
---     def e8 := res8.2.2.1
---     def out3 := res8.2.2.2
---     #eval shimVec5
---     #eval net5
---     #eval e8
---     #eval out3
--- end test3
--- ----------------------------------------------------------------------
--- -- test 4: 4 shims, test msg send to sharers
--- -- setup: all shims cache all addresses (all valid and sharers)
--- namespace test4
--- def c := {(default : SystemConfig) with threads := 4}
--- def shimVec1 := Vector.replicate 4 (default : Shim c)
--- #eval shimVec1
--- #eval (default : Instr c)
--- def e1 : Execution c :=
---     fun (s : ShimId c) =>
---         fun (t : QInd c) =>
---             match s, t with
---             | 0, 0 => {(default : Instr c) with access := PermissionType.store, data := 1}
---             | _, _ => (default)
--- def out1 := (default : Output c)
--- def net1 := (default : NETOrdered c)
--- def cc1 := (default : CCMachine c)
--- #eval cc1
-
--- def res1 := getInstr 0 shimVec1 e1
---     def e2 := res1.1
---     def i1 := res1.2
---     #eval e2
---     #eval i1
--- def res2 := shimWrite 0 i1.addr i1.data i1.stren shimVec1 e2 net1
---     def shimVec2 := res2.1
---     def e3 := res2.2.1
---     def net2 := res2.2.2
---     #eval shimVec2
---     #eval e3
---     #eval net2
-
--- def res3 := CCReceive (net2.get 4).head! cc1 net2
---     def cc2 := res3.1
---     def net3 := res3.2
---     #eval cc2
---     #eval net3
